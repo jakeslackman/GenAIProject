@@ -7,7 +7,7 @@ def add_arguments_predict(parser: ap.ArgumentParser):
     """
 
     parser.add_argument(
-        "--output_dir",
+        "--output-dir",
         type=str,
         required=True,
         help="Path to the output_dir containing the config.yaml file that was saved during training.",
@@ -20,7 +20,7 @@ def add_arguments_predict(parser: ap.ArgumentParser):
     )
 
     parser.add_argument(
-        "--test_time_finetune",
+        "--test-time-finetune",
         type=int,
         default=0,
         help="If >0, run test-time fine-tuning for the specified number of epochs on only control cells.",
@@ -35,9 +35,15 @@ def add_arguments_predict(parser: ap.ArgumentParser):
     )
 
     parser.add_argument(
-        "--predict_only",
+        "--predict-only",
         action="store_true",
         help="If set, only run prediction without evaluation metrics.",
+    )
+
+    parser.add_argument(
+        "--eval-train-data",
+        action="store_true",
+        help="If set, evaluate the model on the training data rather than on the test data.",
     )
 
 
@@ -185,15 +191,22 @@ def run_tx_predict(args: ap.ArgumentParser):
     data_module.batch_size = 1
     if args.test_time_finetune > 0:
         control_pert = data_module.get_control_pert()
-        test_loader = data_module.test_dataloader()
+        if args.eval_train_data:
+            test_loader = data_module.train_dataloader()
+        else:
+            test_loader = data_module.test_dataloader()
         run_test_time_finetune(
             model, test_loader, args.test_time_finetune, control_pert, device=next(model.parameters()).device
         )
         logger.info("Test-time fine-tuning complete.")
 
     # 5. Run inference on test set
-    data_module.setup(stage="test")
-    test_loader = data_module.test_dataloader()
+    if args.eval_train_data:
+        data_module.setup(stage="train")
+        test_loader = data_module.train_dataloader()
+    else:
+        data_module.setup(stage="test")
+        test_loader = data_module.test_dataloader()
 
     if test_loader is None:
         logger.warning("No test dataloader found. Exiting.")
@@ -207,8 +220,11 @@ def run_tx_predict(args: ap.ArgumentParser):
     logger.info("Generating predictions on test set using manual loop...")
     device = next(model.parameters()).device
 
+    
     final_preds = np.empty((num_cells, output_dim), dtype=np.float32)
     final_reals = np.empty((num_cells, output_dim), dtype=np.float32)
+
+    print(final_preds.shape)
 
     store_raw_expression = (
         data_module.embed_key is not None
@@ -339,7 +355,11 @@ def run_tx_predict(args: ap.ArgumentParser):
         adata_real = anndata.AnnData(X=final_reals, obs=obs)
 
     # Save the AnnData objects
-    results_dir = os.path.join(args.output_dir, "eval_" + os.path.basename(args.checkpoint))
+    if args.eval_train_data:
+        results_dir = os.path.join(args.output_dir, "eval_train_" + os.path.basename(args.checkpoint))
+    else:
+        results_dir = os.path.join(args.output_dir, "eval_" + os.path.basename(args.checkpoint))
+
     os.makedirs(results_dir, exist_ok=True)
     adata_pred_path = os.path.join(results_dir, "adata_pred.h5ad")
     adata_real_path = os.path.join(results_dir, "adata_real.h5ad")
