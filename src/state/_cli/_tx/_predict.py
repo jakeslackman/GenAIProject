@@ -224,8 +224,6 @@ def run_tx_predict(args: ap.ArgumentParser):
     final_preds = np.empty((num_cells, output_dim), dtype=np.float32)
     final_reals = np.empty((num_cells, output_dim), dtype=np.float32)
 
-    print(final_preds.shape)
-
     store_raw_expression = (
         data_module.embed_key is not None
         and data_module.embed_key != "X_hvg"
