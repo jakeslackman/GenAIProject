@@ -41,7 +41,7 @@ def create_embedded_configs():
 # training tasks
 defaults:
   - data: perturbation
-  - model: pertsets
+  - model: state
   - training: default
   - wandb: default
   - _self_
@@ -95,11 +95,30 @@ model:
 
 # Data configuration
 data:
-  batch_size: 32
-  num_workers: 4
-  kwargs:
-    transform: "log-normalize"
-    train_task: "perturbation"
+    name: PerturbationDataModule
+    kwargs:
+    toml_config_path: null
+    embed_key: null
+    output_space: all
+    pert_rep: onehot
+    basal_rep: sample
+    num_workers: 12
+    pin_memory: true
+    n_basal_samples: 1
+    basal_mapping_strategy: random
+    should_yield_control_cells: true
+    batch_col: gem_group
+    pert_col: gene
+    cell_type_key: cell_type
+    control_pert: DMSO_TF
+    map_controls: true # for a control cell, should we use it as the target (learn identity) or sample a control?
+    perturbation_features_file: null
+    store_raw_basal: false
+    int_counts: false
+    barcode: true
+    output_dir: null
+    debug: true
+
 
 # Training configuration
 training:
@@ -116,53 +135,86 @@ overwrite: false
 # Logging configuration
 use_wandb: false
 """,
-        "data/perturbation.yaml": """# Data configuration for perturbation tasks
+        "data/perturbation.yaml": """name: PerturbationDataModule
 kwargs:
   toml_config_path: null
-  num_workers: 4
-  batch_col: "batch"
-  pert_col: "perturbation"
-  cell_type_key: "cell_type"
-  control_pert: "control"
+  embed_key: null
+  output_space: all
+  pert_rep: onehot
+  basal_rep: sample
+  num_workers: 12
+  pin_memory: true
+  n_basal_samples: 1
+  basal_mapping_strategy: random
+  should_yield_control_cells: true
+  batch_col: gem_group
+  pert_col: gene
+  cell_type_key: cell_type
+  control_pert: DMSO_TF
+  map_controls: true # for a control cell, should we use it as the target (learn identity) or sample a control?
   perturbation_features_file: null
-  transform: "log-normalize"
-  train_task: "perturbation"
-  dataset_cls: "PerturbationDataset"
+  store_raw_basal: false
+  int_counts: false
+  barcode: true
+output_dir: null
+debug: true
 """,
-        "model/pertsets.yaml": """# Model configuration for perturbation sets
-name: "state_sm"
+        "model/state.yaml": """name: state
+checkpoint: null
+device: cuda
+
 kwargs:
-  hidden_dim: 512
-  num_layers: 6
-  num_heads: 8
-  dropout: 0.1
-  activation: "gelu"
-  cell_set_len: 1
+  cell_set_len: 512
+  blur: 0.05
+  hidden_dim: 696      # hidden dimension going into the transformer backbone
+  loss: energy
+  confidence_head: False
+  n_encoder_layers: 4
+  n_decoder_layers: 4
+  predict_residual: True
+  softplus: True
+  freeze_pert: False
+  transformer_decoder: False
+  finetune_vci_decoder: False
+  residual_decoder: False
+  batch_encoder: False
+  nb_decoder: False
+  mask_attn: False
+  use_effect_gating_token: False
+  distributional_loss: energy
+  init_from: null
+  transformer_backbone_key: llama
   transformer_backbone_kwargs:
-    n_positions: 1024
-    max_position_embeddings: 1024
+      max_position_embeddings: ${model.kwargs.cell_set_len}
+      hidden_size: ${model.kwargs.hidden_dim}
+      intermediate_size: 2784
+      num_hidden_layers: 8
+      num_attention_heads: 12
+      num_key_value_heads: 12
+      head_dim: 58
+      use_cache: false
+      attention_dropout: 0.0
+      hidden_dropout: 0.0
+      layer_norm_eps: 1e-6
+      pad_token_id: 0
+      bos_token_id: 1
+      eos_token_id: 2
+      tie_word_embeddings: false
+      rotary_dim: 0
+      use_rotary_embeddings: false
 """,
-        "model/state_sm.yaml": """# Model configuration for state_sm
-name: "state_sm"
-kwargs:
-  hidden_dim: 512
-  num_layers: 6
-  num_heads: 8
-  dropout: 0.1
-  activation: "gelu"
-  cell_set_len: 1
-  transformer_backbone_kwargs:
-    n_positions: 1024
-    max_position_embeddings: 1024
-""",
-        "training/default.yaml": """# Default training configuration
-max_steps: 10000
-ckpt_every_n_steps: 1000
+        "training/default.yaml": """wandb_track: false
+weight_decay: 0.0005
+batch_size: 16
+lr: 1e-4
+max_steps: 40000
 train_seed: 42
-batch_size: 32
-lr: 0.001
-weight_decay: 0.0001
-max_epochs: 100
+val_freq: 2000
+ckpt_every_n_steps: 2000
+gradient_clip_val: 10 # 0 means no clipping
+loss_fn: mse
+devices: 1  # Number of GPUs to use for training
+strategy: auto  # DDP strategy for multi-GPU training
 """,
         "wandb/default.yaml": """# Generic wandb configuration
 # Users should customize these values for their own use
