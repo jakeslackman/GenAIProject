@@ -192,7 +192,7 @@ def run_tx_predict(args: ap.ArgumentParser):
     if args.test_time_finetune > 0:
         control_pert = data_module.get_control_pert()
         if args.eval_train_data:
-            test_loader = data_module.train_dataloader()
+            test_loader = data_module.train_dataloader(test=True)
         else:
             test_loader = data_module.test_dataloader()
         run_test_time_finetune(
@@ -203,7 +203,7 @@ def run_tx_predict(args: ap.ArgumentParser):
     # 5. Run inference on test set
     if args.eval_train_data:
         data_module.setup(stage="train")
-        test_loader = data_module.train_dataloader()
+        test_loader = data_module.train_dataloader(test=True)
     else:
         data_module.setup(stage="test")
         test_loader = data_module.test_dataloader()
@@ -290,8 +290,15 @@ def run_tx_predict(args: ap.ArgumentParser):
             batch_pred_np = batch_preds["preds"].cpu().numpy().astype(np.float32)
             batch_real_np = batch_preds["pert_cell_emb"].cpu().numpy().astype(np.float32)
             batch_size = batch_pred_np.shape[0]
-            final_preds[current_idx : current_idx + batch_size, :] = batch_pred_np
-            final_reals[current_idx : current_idx + batch_size, :] = batch_real_np
+
+            try:
+                final_preds[current_idx : current_idx + batch_size, :] = batch_pred_np
+                final_reals[current_idx : current_idx + batch_size, :] = batch_real_np
+            except Exception as e:
+                print(batch_pred_np.shape, batch_real_np.shape)
+                print(final_preds.shape, final_reals.shape)
+                print(current_idx, batch_size)
+                raise e
             current_idx += batch_size
 
             # Handle X_hvg for HVG space ground truth

@@ -39,13 +39,100 @@ def create_embedded_configs():
     configs = {
         "config.yaml": """# This is a template used in the application to generating the config file for
 # training tasks
-defaults:
-  - data: perturbation
-  - model: state
-  - training: default
-  - wandb: default
-  - _self_
-  
+# Note: This config inlines all the defaults to avoid Hydra resolution issues
+
+# Data configuration (from data/perturbation.yaml)
+data:
+  name: PerturbationDataModule
+  kwargs:
+    toml_config_path: null
+    embed_key: null
+    output_space: all
+    pert_rep: onehot
+    basal_rep: sample
+    num_workers: 12
+    pin_memory: true
+    n_basal_samples: 1
+    basal_mapping_strategy: random
+    should_yield_control_cells: true
+    batch_col: gem_group
+    pert_col: gene
+    cell_type_key: cell_type
+    control_pert: DMSO_TF
+    map_controls: true # for a control cell, should we use it as the target (learn identity) or sample a control?
+    perturbation_features_file: null
+    store_raw_basal: false
+    int_counts: false
+    barcode: true
+  output_dir: null
+  debug: true
+
+# Model configuration (from model/state.yaml)
+model:
+  name: state
+  checkpoint: null
+  device: cuda
+  kwargs:
+    cell_set_len: 512
+    blur: 0.05
+    hidden_dim: 696      # hidden dimension going into the transformer backbone
+    loss: energy
+    confidence_head: False
+    n_encoder_layers: 4
+    n_decoder_layers: 4
+    predict_residual: True
+    softplus: True
+    freeze_pert: False
+    transformer_decoder: False
+    finetune_vci_decoder: False
+    residual_decoder: False
+    batch_encoder: False
+    nb_decoder: False
+    mask_attn: False
+    use_effect_gating_token: False
+    distributional_loss: energy
+    init_from: null
+    transformer_backbone_key: llama
+    transformer_backbone_kwargs:
+        max_position_embeddings: ${model.kwargs.cell_set_len}
+        hidden_size: ${model.kwargs.hidden_dim}
+        intermediate_size: 2784
+        num_hidden_layers: 8
+        num_attention_heads: 12
+        num_key_value_heads: 12
+        head_dim: 58
+        use_cache: false
+        attention_dropout: 0.0
+        hidden_dropout: 0.0
+        layer_norm_eps: 1e-6
+        pad_token_id: 0
+        bos_token_id: 1
+        eos_token_id: 2
+        tie_word_embeddings: false
+        rotary_dim: 0
+        use_rotary_embeddings: false
+
+# Training configuration (from training/default.yaml)
+training:
+  wandb_track: false
+  weight_decay: 0.0005
+  batch_size: 16
+  lr: 1e-4
+  max_steps: 40000
+  train_seed: 42
+  val_freq: 2000
+  ckpt_every_n_steps: 2000
+  gradient_clip_val: 10 # 0 means no clipping
+  loss_fn: mse
+  devices: 1  # Number of GPUs to use for training
+  strategy: auto  # DDP strategy for multi-GPU training
+
+# Wandb configuration (from wandb/default.yaml)
+wandb:
+  entity: your_entity_name
+  project: state
+  local_wandb_dir: ./wandb_logs
+  tags: []
 
 # output_dir must be an absolute path (so that launch scripts are fully descriptive)
 name: debug
@@ -1026,7 +1113,7 @@ kwargs:
     return str(config_dir)
 
 
-def load_hydra_config(method: str, overrides: list[str] = None) -> DictConfig:
+def load_hydra_config(method: str, overrides: list[str] | None = None) -> DictConfig:
     """Load Hydra config with optional overrides"""
     if overrides is None:
         overrides = []
@@ -1035,11 +1122,13 @@ def load_hydra_config(method: str, overrides: list[str] = None) -> DictConfig:
     config_dir = create_embedded_configs()
     
     try:
-        # Get just the directory name for relative path
-        config_dir_name = Path(config_dir).name
+        # Use absolute path to ensure Hydra finds our embedded configs
+        config_dir_abs = Path(config_dir).resolve()
         
-        # Initialize Hydra with the configs directory
-        with initialize(version_base=None, config_path=config_dir_name):
+
+        
+        # Initialize Hydra with the absolute path to our embedded configs
+        with initialize(version_base=None, config_path=str(config_dir_abs)):
             match method:
                 case "emb":
                     cfg = compose(config_name="state-defaults", overrides=overrides)
