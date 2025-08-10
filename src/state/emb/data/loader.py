@@ -3,8 +3,10 @@ import logging
 import torch
 import torch.utils.data as data
 import torch.nn.functional as F
+import torch.distributed as dist
 import functools
 import numpy as np
+from tqdm import tqdm
 
 from typing import Dict
 
@@ -285,7 +287,13 @@ class VCIDatasetSentenceCollator(object):
 
         self.global_size = utils.get_embedding_cfg(self.cfg).num
         self.global_to_local = {}
-        for dataset_name, ds_emb_idxs in self.dataset_to_protein_embeddings.items():
+        
+        # Add progress bar to track dataset mapping creation
+        for dataset_name, ds_emb_idxs in tqdm(
+            self.dataset_to_protein_embeddings.items(), 
+            desc="Creating global_to_local mappings",
+            unit="dataset"
+        ):
             # make sure tensor with long data type
             ds_emb_idxs = torch.tensor(ds_emb_idxs, dtype=torch.long)
             # assert ds_emb_idxs.unique().numel() == ds_emb_idxs.numel(), f"duplicate global IDs in dataset {dataset_name}!"

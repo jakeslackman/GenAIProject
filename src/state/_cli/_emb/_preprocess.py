@@ -34,6 +34,10 @@ def add_arguments_preprocess(parser: ap.ArgumentParser):
         "--all-embeddings", default=None,
         help="Path to existing all_embeddings.pt file (if not provided, creates one-hot embeddings)"
     )
+    parser.add_argument(
+        "--uniform-cols", action="store_true",
+        help="Assume all files have identical gene ordering - only process first file for mapping, reuse for others"
+    )
 
 
 def run_emb_preprocess(args):
@@ -90,15 +94,44 @@ def run_emb_preprocess(args):
     dataset_info = {}
     all_genes = set()
 
+    # Store template mapping/mask for uniform cols mode
+    template_mapping = None
+    template_mask = None
+    template_genes = None
+    
     def process_df(df, label):
-        nonlocal all_genes, dataset_info
+        nonlocal all_genes, dataset_info, template_mapping, template_mask, template_genes
         pbar = tqdm(df.iterrows(), total=len(df), desc=f"Processing {label}")
-        for _, row in pbar:
+        
+        for idx, (_, row) in enumerate(pbar):
             name = row["names"]
             path = row["path"]
             if not os.path.exists(path):
                 log.error(f"Dataset file not found: {path}")
                 sys.exit(1)
+            
+            # For uniform cols mode, only process the first file fully
+            if args.uniform_cols and template_mapping is not None:
+                # Just get num_cells for this file, reuse everything else
+                with h5.File(path, 'r') as f:
+                    X = f['X']
+                    attrs = dict(X.attrs)
+                    if 'encoding-type' in attrs and attrs['encoding-type'] in ('csr_matrix', 'csc_matrix'):
+                        num_cells = attrs['shape'][0]
+                    else:
+                        num_cells = X.shape[0] if hasattr(X, 'shape') and len(X.shape) == 2 else len(X['indptr']) - 1
+                
+                dataset_info[name] = {
+                    "num_cells": num_cells, 
+                    "num_genes": len(template_genes), 
+                    "genes": template_genes,
+                    "mapping": template_mapping.clone(),
+                    "mask": template_mask.clone()
+                }
+                pbar.set_postfix({"name": name[:30], "mode": "reused"})
+                continue
+            
+            # Process file normally (first file or non-uniform mode)
             gene_field = detect_gene_name_strategy(path, all_embeddings)
             pbar.set_postfix({"name": name[:30], "field": gene_field})
             num_cells, num_genes, genes = extract_dataset_info(path, gene_field)
@@ -120,10 +153,19 @@ def run_emb_preprocess(args):
             assert mask.count(False) == mapping.count(-1), \
                 f"Dataset {name}: mask False count != mapping -1 count"
 
+            mapping_tensor = torch.tensor(mapping, dtype=torch.long)
+            mask_tensor = torch.tensor(mask, dtype=torch.bool)
+            
             dataset_info[name] = {"num_cells": num_cells, "num_genes": num_genes, "genes": genes}
-            dataset_info[name]["mapping"] = torch.tensor(mapping, dtype=torch.long)
-            dataset_info[name]["mask"] = torch.tensor(mask, dtype=torch.bool)
+            dataset_info[name]["mapping"] = mapping_tensor
+            dataset_info[name]["mask"] = mask_tensor
             all_genes.update(genes)
+            
+            # Store as template for uniform cols mode
+            if args.uniform_cols and template_mapping is None:
+                template_mapping = mapping_tensor
+                template_mask = mask_tensor
+                template_genes = genes
 
     process_df(train_df, "training")
     process_df(val_df, "validation")
