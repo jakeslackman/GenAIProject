@@ -288,23 +288,57 @@ class VCIDatasetSentenceCollator(object):
         self.global_size = utils.get_embedding_cfg(self.cfg).num
         self.global_to_local = {}
         
-        # Add progress bar to track dataset mapping creation
-        for dataset_name, ds_emb_idxs in tqdm(
-            self.dataset_to_protein_embeddings.items(), 
-            desc="Creating global_to_local mappings",
-            unit="dataset"
-        ):
-            # make sure tensor with long data type
-            ds_emb_idxs = torch.tensor(ds_emb_idxs, dtype=torch.long)
-            # assert ds_emb_idxs.unique().numel() == ds_emb_idxs.numel(), f"duplicate global IDs in dataset {dataset_name}!"
+        # Handle distributed training: only rank 0 creates mappings, then broadcasts
+        is_distributed = dist.is_initialized()
+        is_main_process = not is_distributed or dist.get_rank() == 0
+        
+        if is_main_process:
+            # Add progress bar to track dataset mapping creation (only on main process)
+            for dataset_name, ds_emb_idxs in tqdm(
+                self.dataset_to_protein_embeddings.items(), 
+                desc="Creating global_to_local mappings",
+                unit="dataset"
+            ):
+                # make sure tensor with long data type
+                ds_emb_idxs = torch.tensor(ds_emb_idxs, dtype=torch.long)
+                # assert ds_emb_idxs.unique().numel() == ds_emb_idxs.numel(), f"duplicate global IDs in dataset {dataset_name}!"
 
-            # Create a tensor filled with -1 (indicating not present in this dataset)
-            reverse_mapping = torch.full((self.global_size,), -1, dtype=torch.int64)
+                # Create a tensor filled with -1 (indicating not present in this dataset)
+                reverse_mapping = torch.full((self.global_size,), -1, dtype=torch.int64)
 
-            local_indices = torch.arange(ds_emb_idxs.size(0), dtype=torch.int64)
-            mask = (ds_emb_idxs >= 0) & (ds_emb_idxs < self.global_size)
-            reverse_mapping[ds_emb_idxs[mask]] = local_indices[mask]
-            self.global_to_local[dataset_name] = reverse_mapping
+                local_indices = torch.arange(ds_emb_idxs.size(0), dtype=torch.int64)
+                mask = (ds_emb_idxs >= 0) & (ds_emb_idxs < self.global_size)
+                reverse_mapping[ds_emb_idxs[mask]] = local_indices[mask]
+                self.global_to_local[dataset_name] = reverse_mapping
+        
+        # Synchronize all processes and broadcast mappings from rank 0
+        if is_distributed:
+            # First, synchronize all processes
+            dist.barrier()
+            
+            # Broadcast the mappings from rank 0 to all other ranks
+            if dist.get_rank() == 0:
+                # Convert to list of (key, tensor) pairs for broadcasting
+                mapping_items = [(name, mapping) for name, mapping in self.global_to_local.items()]
+            else:
+                mapping_items = [None] * len(self.dataset_to_protein_embeddings)
+            
+            # Broadcast the number of datasets first
+            num_datasets = torch.tensor(len(self.dataset_to_protein_embeddings), dtype=torch.int64)
+            dist.broadcast(num_datasets, src=0)
+            
+            # Broadcast each mapping
+            for i, dataset_name in enumerate(self.dataset_to_protein_embeddings.keys()):
+                if dist.get_rank() == 0:
+                    mapping_tensor = self.global_to_local[dataset_name]
+                else:
+                    mapping_tensor = torch.full((self.global_size,), -1, dtype=torch.int64)
+                
+                dist.broadcast(mapping_tensor, src=0)
+                self.global_to_local[dataset_name] = mapping_tensor
+            
+            # Final barrier to ensure all processes have the mappings
+            dist.barrier()
 
     def __call__(self, batch):
         num_aug = getattr(self.cfg.model, "num_downsample", 1)
