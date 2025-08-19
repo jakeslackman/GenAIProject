@@ -27,6 +27,9 @@ def add_arguments_infer(parser: argparse.ArgumentParser):
         "--celltypes", type=str, default=None, help="Comma-separated list of cell types to include (optional)"
     )
     parser.add_argument("--batch_size", type=int, default=1000, help="Batch size for inference (default: 1000)")
+    parser.add_argument(
+        "--batch_col", type=str, default=None, help="Column in adata.obs for batch labels (optional)"
+    )
 
 
 def run_tx_infer(args):
@@ -70,6 +73,7 @@ def run_tx_infer(args):
     with open(var_dims_path, "rb") as f:
         var_dims = pickle.load(f)
     pert_dim = var_dims["pert_dim"]
+    batch_dim = var_dims["batch_dim"]
 
     # Load model
     logger.info(f"Loading model from checkpoint: {checkpoint_path}")
@@ -115,6 +119,11 @@ def run_tx_infer(args):
     pert_onehot_map_path = os.path.join(args.model_dir, "pert_onehot_map.pt")
     pert_onehot_map = torch.load(pert_onehot_map_path, weights_only=False)
 
+    # Load batch mapping from pickle file
+    batch_onehot_map_path = os.path.join(args.model_dir, "batch_onehot_map.pkl")
+    with open(batch_onehot_map_path, "rb") as f:
+        batch_onehot_map = pickle.load(f)
+
     logger.info(f"Data module has {len(pert_onehot_map)} perturbations in mapping")
     logger.info(f"First 10 perturbations in data module: {list(pert_onehot_map.keys())[:10]}")
 
@@ -151,6 +160,44 @@ def run_tx_infer(args):
 
     logger.info(f"Matched {matched_count} out of {len(pert_names)} perturbations")
 
+    # Prepare batch tensor using the data module's mapping
+    batch_tensor = torch.zeros((len(pert_names), batch_dim), device="cpu")  # Keep on CPU initially
+    logger.info(f"Batch tensor shape: {batch_tensor.shape}")
+
+    # Get batch names from adata if batch_col is provided
+    if args.batch_col is not None and args.batch_col in adata.obs:
+        batch_names = adata.obs[args.batch_col].values
+        logger.info(f"Using batch column '{args.batch_col}' from adata.obs")
+        unique_batch_names = sorted(set(batch_names))
+        logger.info(f"AnnData has {len(unique_batch_names)} unique batches")
+        logger.info(f"First 10 batches in AnnData: {unique_batch_names[:10]}")
+        
+        # Check overlap between adata batch names and data module batch mapping
+        overlap_batches = set(unique_batch_names) & set(batch_onehot_map.keys())
+        logger.info(f"Overlap between AnnData and data module batches: {len(overlap_batches)} batches")
+        if len(overlap_batches) < len(unique_batch_names):
+            missing_batches = set(unique_batch_names) - set(batch_onehot_map.keys())
+            logger.warning(f"Missing batch mappings: {list(missing_batches)[:10]}")
+        
+        # Encode batch information
+        matched_batch_count = 0
+        first_batch = list(batch_onehot_map.keys())[0]  # Fallback batch
+        for idx, batch_name in enumerate(batch_names):
+            if batch_name in batch_onehot_map:
+                batch_tensor[idx] = batch_onehot_map[batch_name]
+                matched_batch_count += 1
+            else:
+                # Use first available batch as fallback
+                batch_tensor[idx] = batch_onehot_map[first_batch]
+        
+        logger.info(f"Matched {matched_batch_count} out of {len(batch_names)} batch names")
+    else:
+        logger.info("No batch column provided or found, using first available batch for all samples")
+        # Use first available batch for all samples
+        first_batch = list(batch_onehot_map.keys())[0]
+        for idx in range(len(pert_names)):
+            batch_tensor[idx] = batch_onehot_map[first_batch]
+
     # Process in batches with progress bar
     # Use cell_sentence_len as batch size since model expects this
     n_samples = len(pert_names)
@@ -174,6 +221,7 @@ def run_tx_infer(args):
             # Get batch data
             X_batch = torch.tensor(X[start_idx:end_idx], dtype=torch.float32).to(device)
             pert_batch = pert_tensor[start_idx:end_idx].to(device)
+            batch_info_batch = batch_tensor[start_idx:end_idx].to(device)
             pert_names_batch = pert_names[start_idx:end_idx].tolist()
 
             # Pad the batch to cell_sentence_len if it's the last incomplete batch
@@ -191,6 +239,12 @@ def run_tx_infer(args):
                     pert_pad[:, 0] = 1  # Default to first perturbation
                 pert_batch = torch.cat([pert_batch, pert_pad], dim=0)
 
+                # Pad batch tensor with first available batch
+                batch_pad = torch.zeros((padding_size, batch_info_batch.shape[1]), device=device)
+                first_batch = list(batch_onehot_map.keys())[0]
+                batch_pad[:] = batch_onehot_map[first_batch].to(device)
+                batch_info_batch = torch.cat([batch_info_batch, batch_pad], dim=0)
+
                 # Extend perturbation names
                 pert_names_batch.extend([control_pert] * padding_size)
 
@@ -199,7 +253,7 @@ def run_tx_infer(args):
                 "ctrl_cell_emb": X_batch,
                 "pert_emb": pert_batch,  # Keep as 2D tensor
                 "pert_name": pert_names_batch,
-                "batch": torch.zeros((1, cell_sentence_len), device=device),  # Use (1, cell_sentence_len)
+                "batch": batch_info_batch,  # Keep as 2D one-hot tensor: (cell_sentence_len, batch_dim)
             }
 
             # Run inference on batch using padded=False like in working code
