@@ -292,15 +292,24 @@ def run_tx_predict(args: ap.ArgumentParser):
     logger.info("Creating anndatas from predictions from manual loop...")
 
     # Build pandas DataFrame for obs and var
-    obs = pd.DataFrame(
-        {
-            data_module.pert_col: all_pert_names,
-            data_module.cell_type_key: all_celltypes,
-            data_module.batch_col: all_gem_groups,
-            "pert_cell_barcode": all_pert_barcodes,
-            "ctrl_cell_barcode": all_ctrl_barcodes,
-        }
-    )
+    try:
+        obs = pd.DataFrame(
+            {
+                data_module.pert_col: all_pert_names,
+                data_module.cell_type_key: all_celltypes,
+                data_module.batch_col: all_gem_groups,
+                "pert_cell_barcode": all_pert_barcodes,
+                "ctrl_cell_barcode": all_ctrl_barcodes,
+            }
+        )
+    except:
+        obs = pd.DataFrame(
+            {
+                data_module.pert_col: all_pert_names,
+                data_module.cell_type_key: all_celltypes,
+                data_module.batch_col: all_gem_groups,
+            }
+        )
 
     gene_names = var_dims["gene_names"]
     var = pd.DataFrame({"gene_names": gene_names})
