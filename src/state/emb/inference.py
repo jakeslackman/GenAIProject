@@ -252,6 +252,7 @@ class Inference:
 
         # Check all columns in var
         for col in adata.var.columns:
+            print(col)
             if adata.var[col].dtype == "object" or adata.var[col].dtype.name.startswith("str"):
                 col_genes = set(adata.var[col].dropna().astype(str))
                 overlap = len(protein_genes.intersection(col_genes))
@@ -262,6 +263,8 @@ class Inference:
                     best_column = col
 
         if best_column is None:
+            if best_overlap == 0:
+                raise ValueError("No appropriate gene column found with matching gene names")
             log.info(
                 f"Auto-detected gene column: var.index (overlap: {best_overlap}/{len(protein_genes)} protein embeddings, {best_overlap_pct:.1%} of genes)"
             )
