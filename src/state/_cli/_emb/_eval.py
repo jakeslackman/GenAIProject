@@ -11,22 +11,7 @@ def add_arguments_eval(parser: ap.ArgumentParser):
         "--control-pert", default="non-targeting", help="Control perturbation label (default: non-targeting)"
     )
     parser.add_argument("--gene-column", default="gene_name", help="Column name for gene names (default: gene_name)")
-
-
-def load_config(config_path: str | None = None):
-    """Load config from YAML file or create default config."""
-    if config_path and os.path.exists(config_path):
-        cfg = OmegaConf.load(config_path)
-        return cfg
-    else:
-        # Create minimal default config for inference
-        cfg_dict = {
-            "model": {"batch_size": 32, "rda": False},
-            "dataset": {"P": 1000, "N": 1000},
-            "validations": {"diff_exp": {"top_k_rank": 50, "method": "wilcoxon"}},
-            "embeddings": {"current": "default", "default": {"all_embeddings": "path/to/embeddings.pt", "size": 5120}},
-        }
-        return OmegaConf.create(cfg_dict)
+    parser.add_argument("--batch-size", type=int, default=32, help="Batch size for processing (default: 32)")
 
 
 def run_emb_eval(args):
@@ -43,6 +28,21 @@ def run_emb_eval(args):
     from tqdm import tqdm
     from omegaconf import OmegaConf, DictConfig
 
+    def load_config(config_path: str | None = None):
+        """Load config from YAML file or create default config."""
+        if config_path and os.path.exists(config_path):
+            cfg = OmegaConf.load(config_path)
+            return cfg
+        else:
+            # Create minimal default config for inference
+            cfg_dict = {
+                "model": {"batch_size": 32, "rda": False},
+                "dataset": {"P": 1000, "N": 1000},
+                "validations": {"diff_exp": {"top_k_rank": 50, "method": "wilcoxon"}},
+                "embeddings": {"current": "default", "default": {"all_embeddings": "path/to/embeddings.pt", "size": 5120}},
+            }
+            return OmegaConf.create(cfg_dict)
+
     from ...emb.nn.model import StateEmbeddingModel
     from ...emb.utils import compute_gene_overlap_cross_pert, get_embedding_cfg, get_precision_config
     from ...emb.data import create_dataloader
@@ -52,6 +52,7 @@ def run_emb_eval(args):
     print(f"Loading AnnData: {args.adata}")
     print(f"Perturbation column: {args.pert_col}")
     print(f"Control perturbation: {args.control_pert}")
+    print(f"Batch size: {args.batch_size}")
 
     if args.config:
         print(f"Loading config: {args.config}")
@@ -60,6 +61,9 @@ def run_emb_eval(args):
 
     # Load configuration
     cfg = load_config(args.config)
+    
+    # Override batch size with command line argument
+    cfg.model.batch_size = args.batch_size
 
     # Load AnnData
     adata = sc.read_h5ad(args.adata)
