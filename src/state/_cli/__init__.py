@@ -2,6 +2,7 @@ from ._emb import add_arguments_emb, run_emb_fit, run_emb_transform, run_emb_que
 from ._tx import (
     add_arguments_tx,
     run_tx_infer,
+    run_tx_infer_with_hooks,
     run_tx_predict,
     run_tx_preprocess_infer,
     run_tx_preprocess_train,
@@ -14,6 +15,7 @@ __all__ = [
     "run_tx_train",
     "run_tx_predict",
     "run_tx_infer",
+    "run_tx_infer_with_hooks",
     "run_tx_preprocess_train",
     "run_tx_preprocess_infer",
     "run_emb_fit",
