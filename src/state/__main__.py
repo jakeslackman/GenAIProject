@@ -14,6 +14,7 @@ from ._cli import (
     run_tx_infer,
     run_tx_infer_with_hooks,
     run_tx_predict,
+    run_tx_predict_with_hooks,
     run_tx_preprocess_infer,
     run_tx_preprocess_train,
     run_tx_train,
@@ -123,6 +124,9 @@ def main():
                 case "predict":
                     # For now, predict uses argparse and not hydra
                     run_tx_predict(args)
+                case "predict_with_hooks":
+                    # Run prediction with attention hooks for ablation studies
+                    run_tx_predict_with_hooks(args)
                 case "infer":
                     # Run inference using argparse, similar to predict
                     run_tx_infer(args)
