@@ -94,6 +94,18 @@ def add_arguments_infer_with_hooks(parser: argparse.ArgumentParser):
         default=None,
         help="Path to save attention visualization (e.g., 'attention_vis.png'). If not provided, attention weights are printed to console.",
     )
+    parser.add_argument(
+        "--attention-head-layer",
+        type=int,
+        default=None,
+        help="Layer index to remove attention head contributions from. Requires --attention-head-index to be specified.",
+    )
+    parser.add_argument(
+        "--attention-head-index",
+        type=int,
+        default=None,
+        help="Index of attention head to remove contributions from (0-based). Requires --attention-head-layer to be specified.",
+    )
 
 
 def run_tx_infer(args: argparse.Namespace):
@@ -390,6 +402,137 @@ def run_tx_infer(args: argparse.Namespace):
                 print(f"Attention visualization saved to: {output_path}")
 
     # -----------------------
+    # Attention Head Removal Functions
+    # -----------------------
+    def create_head_removal_forward_hook(head_index):
+        """Create a forward hook that zeros out contributions from a specific attention head."""
+        def head_removal_hook(module, input, output):
+            """Hook function to zero out specific attention head contributions."""
+            # Handle tuple outputs first (e.g., (attn_output, attn_weights, ...))
+            if isinstance(output, tuple) and len(output) >= 1:
+                main_output = output[0]
+                if main_output is not None and hasattr(main_output, 'dim') and main_output.dim() == 3:
+                    hidden_dim = main_output.shape[-1]
+                    num_heads = getattr(module, 'num_heads', getattr(module, 'num_attention_heads', None))
+                    if num_heads is None or num_heads <= 1:
+                        # Infer heads if attribute missing
+                        candidates = [32, 24, 16, 12, 8, 4, 2]
+                        num_heads = next((h for h in candidates if hidden_dim % h == 0), 1)
+                    if num_heads > 1 and 0 <= head_index < num_heads:
+                        head_dim = hidden_dim // num_heads
+                        start_idx = head_index * head_dim
+                        end_idx = min(start_idx + head_dim, hidden_dim)
+                        main_output[:, :, start_idx:end_idx] = 0.0
+                        if not args.quiet:
+                            print(f"[hook:fallback] Zeroed head {head_index} on post-proj tensor slice {start_idx}:{end_idx}")
+                return (main_output,) + tuple(output[1:])
+
+            # If module returns a Tensor directly, attempt best-effort zeroing on last-dim slice
+            if hasattr(output, 'dim') and output.dim() == 3:
+                hidden_dim = output.shape[-1]
+                num_heads = getattr(module, 'num_heads', getattr(module, 'num_attention_heads', None))
+                if num_heads is None or num_heads <= 1:
+                    candidates = [32, 24, 16, 12, 8, 4, 2]
+                    num_heads = next((h for h in candidates if hidden_dim % h == 0), 1)
+                if num_heads > 1 and 0 <= head_index < num_heads:
+                    head_dim = hidden_dim // num_heads
+                    start_idx = head_index * head_dim
+                    end_idx = min(start_idx + head_dim, hidden_dim)
+                    output[:, :, start_idx:end_idx] = 0.0
+                    if not args.quiet:
+                        print(f"[hook:fallback] Zeroed head {head_index} on direct tensor slice {start_idx}:{end_idx}")
+                return output
+
+            return output
+        
+        return head_removal_hook
+
+    def apply_head_removal_patch(model, layer_idx, head_idx, quiet=False):
+        """Apply monkey patch to remove contributions from a specific attention head."""
+        hooks = []
+        
+        # Get the transformer backbone
+        transformer = model.transformer_backbone
+        
+        # Find the attention layer
+        target_layer = None
+        if hasattr(transformer, 'h') and len(transformer.h) > layer_idx:
+            # GPT2-style model
+            target_layer = transformer.h[layer_idx]
+            if hasattr(target_layer, 'attn'):
+                target_module = target_layer.attn
+            else:
+                if not quiet:
+                    print(f"Warning: Layer {layer_idx} does not have 'attn' attribute")
+                return hooks
+        elif hasattr(transformer, 'layers') and len(transformer.layers) > layer_idx:
+            # Llama-style model
+            target_layer = transformer.layers[layer_idx]
+            if hasattr(target_layer, 'self_attn'):
+                target_module = target_layer.self_attn
+            else:
+                if not quiet:
+                    print(f"Warning: Layer {layer_idx} does not have 'self_attn' attribute")
+                return hooks
+        else:
+            if not quiet:
+                print(f"Warning: Could not find layer {layer_idx} in transformer backbone")
+            return hooks
+        
+        # Prefer intercepting BEFORE the output projection to avoid mixed-head contamination
+        proj_module = None
+        for attr_name in ['c_proj', 'o_proj', 'out_proj']:
+            if hasattr(target_module, attr_name):
+                proj_module = getattr(target_module, attr_name)
+                if proj_module is not None:
+                    break
+
+        if proj_module is not None:
+            parent_attn_module = target_module
+
+            def pre_zero_hook(module, inputs):
+                # inputs is a tuple; first element is the tensor of shape [..., hidden_dim]
+                if not inputs or inputs[0] is None:
+                    return inputs
+                x = inputs[0]
+                if not hasattr(x, 'shape') or x is None:
+                    return inputs
+                if x.dim() < 2:
+                    return inputs
+
+                hidden_dim = x.shape[-1]
+                # Determine number of heads from the attention module if available
+                num_heads_local = getattr(parent_attn_module, 'num_heads', getattr(parent_attn_module, 'num_attention_heads', None))
+                if num_heads_local is None or num_heads_local <= 1:
+                    candidates = [32, 24, 16, 12, 8, 4, 2]
+                    num_heads_local = next((h for h in candidates if hidden_dim % h == 0), 1)
+
+                if num_heads_local > 1 and 0 <= head_idx < num_heads_local:
+                    head_dim = hidden_dim // num_heads_local
+                    start_idx = head_idx * head_dim
+                    end_idx = min(start_idx + head_dim, hidden_dim)
+                    x = x.clone()  # avoid in-place on shared tensors
+                    x[..., start_idx:end_idx] = 0.0
+                    if not quiet:
+                        print(f"Applied pre-proj head zeroing: layer {layer_idx}, head {head_idx}, slice {start_idx}:{end_idx}, shape {tuple(x.shape)}")
+                    return (x,)
+                return inputs
+
+            hook = proj_module.register_forward_pre_hook(pre_zero_hook)
+            hooks.append(hook)
+            if not quiet:
+                print(f"Applied head removal pre-hook on projection: layer {layer_idx}, head {head_idx}")
+        else:
+            # Fallback: post-projection forward hook on the attention module output
+            hook_fn = create_head_removal_forward_hook(head_idx)
+            hook = target_module.register_forward_hook(hook_fn)
+            hooks.append(hook)
+            if not quiet:
+                print(f"Applied head removal fallback hook on attn output: layer {layer_idx}, head {head_idx}")
+        
+        return hooks
+
+    # -----------------------
     # Logging
     # -----------------------
     if not args.quiet:
@@ -480,6 +623,10 @@ def run_tx_infer(args: argparse.Namespace):
     uses_batch_encoder = getattr(model, "batch_encoder", None) is not None
     output_space = getattr(model, "output_space", cfg.get("data", {}).get("kwargs", {}).get("output_space", "gene"))
 
+    # Validate attention head removal arguments
+    if (args.attention_head_layer is not None) != (args.attention_head_index is not None):
+        raise ValueError("Both --attention-head-layer and --attention-head-index must be specified together")
+
     # Register attention hooks if requested
     hooks = []
     if args.attention_layer is not None:
@@ -488,6 +635,16 @@ def run_tx_infer(args: argparse.Namespace):
         if hasattr(attention_hook_fn, 'attention_weights'):
             attention_hook_fn.attention_weights = []
 
+    # Apply attention head removal patches if requested
+    head_removal_hooks = []
+    if args.attention_head_layer is not None and args.attention_head_index is not None:
+        head_removal_hooks = apply_head_removal_patch(
+            model, 
+            args.attention_head_layer, 
+            args.attention_head_index, 
+            quiet=args.quiet
+        )
+
     if not args.quiet:
         print(f"Model device: {device}")
         print(f"Model cell_set_len (max sequence length): {cell_set_len}")
@@ -495,6 +652,8 @@ def run_tx_infer(args: argparse.Namespace):
         print(f"Model output space: {output_space}")
         if args.attention_layer is not None:
             print(f"Attention visualization enabled for layer {args.attention_layer}")
+        if args.attention_head_layer is not None:
+            print(f"Attention head removal enabled: layer {args.attention_head_layer}, head {args.attention_head_index}")
 
     # -----------------------
     # 3) Load AnnData
@@ -780,11 +939,18 @@ def run_tx_infer(args: argparse.Namespace):
             if not args.quiet:
                 print("No attention weights were captured during inference")
         
-        # Remove hooks
+        # Remove attention visualization hooks
         for hook in hooks:
             hook.remove()
         if not args.quiet:
-            print(f"Removed {len(hooks)} attention hooks")
+            print(f"Removed {len(hooks)} attention visualization hooks")
+    
+    # Remove attention head removal hooks
+    if head_removal_hooks:
+        for hook in head_removal_hooks:
+            hook.remove()
+        if not args.quiet:
+            print(f"Removed {len(head_removal_hooks)} attention head removal hooks")
 
     # -----------------------
     # 7) Summary
@@ -797,3 +963,5 @@ def run_tx_infer(args: argparse.Namespace):
     print(f"Saved:               {output_path}")
     if args.attention_layer is not None and args.attention_output:
         print(f"Attention visualization: {args.attention_output}")
+    if args.attention_head_layer is not None:
+        print(f"Attention head removal: layer {args.attention_head_layer}, head {args.attention_head_index}")

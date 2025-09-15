@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 import argparse as ap
 from typing import Optional
+from scipy.sparse import issparse, csc_matrix
+
 
 
 def add_arguments_preprocess_infer(parser: ap.ArgumentParser):
@@ -76,7 +78,6 @@ def run_tx_preprocess_infer(
 
     import anndata as ad
     import numpy as np
-    from scipy.sparse import issparse, csc_matrix
     # tqdm removed from the hot path; the main speed-up is vectorization, not progress bars.
 
     logger = logging.getLogger(__name__)
