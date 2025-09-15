@@ -51,6 +51,12 @@ def add_arguments_predict(parser: ap.ArgumentParser):
         action="store_true",
         help="If set, evaluate the model on the training data rather than on the test data.",
     )
+    parser.add_argument(
+        "--results-dir",
+        type=str,
+        default=None,
+        help="Custom directory to save results. If not provided, defaults to <output-dir>/eval_<checkpoint-name>/",
+    )
 
     # Attention head ablation (optional)
     parser.add_argument(
@@ -533,7 +539,10 @@ def run_tx_predict(args: ap.ArgumentParser):
             )
 
     # Save the AnnData objects
-    results_dir = os.path.join(args.output_dir, "eval_" + os.path.basename(args.checkpoint))
+    if args.results_dir is not None:
+        results_dir = args.results_dir
+    else:
+        results_dir = os.path.join(args.output_dir, "eval_" + os.path.basename(args.checkpoint))
     os.makedirs(results_dir, exist_ok=True)
     adata_pred_path = os.path.join(results_dir, "adata_pred.h5ad")
     adata_real_path = os.path.join(results_dir, "adata_real.h5ad")
