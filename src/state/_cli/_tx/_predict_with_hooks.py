@@ -63,13 +63,28 @@ def add_arguments_predict(parser: ap.ArgumentParser):
         "--attention-head-layer",
         type=int,
         default=None,
-        help="Layer index to remove attention head contributions from. Requires --attention-head-index.",
+        help="Layer index to remove attention head contributions from. Requires --attention-head-index or --attention-head-indices.",
     )
     parser.add_argument(
         "--attention-head-index",
         type=int,
         default=None,
         help="Index of attention head to remove contributions from (0-based). Requires --attention-head-layer.",
+    )
+    parser.add_argument(
+        "--attention-head-indices",
+        type=int,
+        nargs="+",
+        default=None,
+        help="Space-separated list of head indices to remove (0-based). Requires --attention-head-layer.",
+    )
+
+    # Full layer ablation (optional)
+    parser.add_argument(
+        "--ablate-layer",
+        type=int,
+        default=None,
+        help="Ablate a whole transformer layer by zeroing its output (0-based).",
     )
 
 
@@ -216,6 +231,52 @@ def run_tx_predict(args: ap.ArgumentParser):
 
         return hooks
 
+    def apply_multi_head_removal_patches(model, layer_idx: int, head_indices: list):
+        """Apply removal hooks for multiple heads on a given layer."""
+        all_hooks = []
+        unique_heads = sorted(set(int(h) for h in head_indices))
+        for h in unique_heads:
+            all_hooks.extend(apply_head_removal_patch(model, layer_idx=layer_idx, head_idx=h))
+        return all_hooks
+
+    def apply_layer_ablation_patch(model, layer_idx: int):
+        """Apply a forward hook to ablate (zero) the output of a transformer layer.
+
+        Tries common backbone layouts: transformer_backbone.h[layer] or .layers[layer]. If the layer's forward
+        returns a tuple, only the first tensor is zeroed and the rest are passed through.
+        """
+        hooks = []
+
+        transformer = getattr(model, "transformer_backbone", None)
+        if transformer is None:
+            logger.warning("Model does not expose 'transformer_backbone'; skipping layer ablation.")
+            return hooks
+
+        target_layer = None
+        if hasattr(transformer, "h") and len(transformer.h) > layer_idx:
+            target_layer = transformer.h[layer_idx]
+        elif hasattr(transformer, "layers") and len(transformer.layers) > layer_idx:
+            target_layer = transformer.layers[layer_idx]
+        else:
+            logger.warning(f"Could not find transformer layer {layer_idx}; skipping layer ablation.")
+            return hooks
+
+        def zero_output_hook(module, inputs, output):
+            if isinstance(output, tuple) and len(output) >= 1:
+                main = output[0]
+                if hasattr(main, "zeros_like") or hasattr(main, "shape"):
+                    main_zeros = torch.zeros_like(main)
+                    return (main_zeros,) + tuple(output[1:])
+                return output
+            if hasattr(output, "zeros_like") or hasattr(output, "shape"):
+                return torch.zeros_like(output)
+            return output
+
+        hook = target_layer.register_forward_hook(zero_output_hook)
+        hooks.append(hook)
+        logger.info(f"Applied full layer ablation hook on layer {layer_idx}")
+        return hooks
+
     def run_test_time_finetune(model, dataloader, ft_epochs, control_pert, device):
         """
         Perform test-time fine-tuning on only control cells.
@@ -333,20 +394,37 @@ def run_tx_predict(args: ap.ArgumentParser):
     model.eval()
     logger.info("Model loaded successfully.")
 
-    # Validate and apply optional attention head removal
-    if (args.attention_head_layer is not None) != (args.attention_head_index is not None):
-        raise ValueError("Both --attention-head-layer and --attention-head-index must be specified together")
+    # Validate and apply attention head and/or layer ablation
+    if args.attention_head_index is not None or (args.attention_head_indices is not None and len(args.attention_head_indices) > 0):
+        if args.attention_head_layer is None:
+            raise ValueError("--attention-head-layer is required when specifying head indices")
 
-    head_removal_hooks = []
-    if args.attention_head_layer is not None and args.attention_head_index is not None:
-        head_removal_hooks = apply_head_removal_patch(
-            model,
-            layer_idx=args.attention_head_layer,
-            head_idx=args.attention_head_index,
-        )
-        logger.info(
-            f"Attention head removal enabled: layer {args.attention_head_layer}, head {args.attention_head_index}"
-        )
+    inference_hooks = []
+
+    # Apply full layer ablation if requested (takes precedence over head removals)
+    if args.ablate_layer is not None:
+        if args.attention_head_index is not None or (args.attention_head_indices is not None and len(args.attention_head_indices) > 0):
+            logger.info(
+                "--ablate-layer set: ignoring provided --attention-head-index/--attention-head-indices and zeroing the layer output"
+            )
+        inference_hooks.extend(apply_layer_ablation_patch(model, layer_idx=args.ablate_layer))
+    else:
+        # Apply head removals if requested (support single or multiple)
+        if args.attention_head_layer is not None and (
+            args.attention_head_index is not None or (args.attention_head_indices is not None and len(args.attention_head_indices) > 0)
+        ):
+            heads = []
+            if args.attention_head_index is not None:
+                heads.append(args.attention_head_index)
+            if args.attention_head_indices is not None:
+                heads.extend(list(args.attention_head_indices))
+            unique_heads = sorted(set(int(h) for h in heads))
+            inference_hooks.extend(
+                apply_multi_head_removal_patches(model, layer_idx=args.attention_head_layer, head_indices=unique_heads)
+            )
+            logger.info(
+                f"Attention head removal enabled: layer {args.attention_head_layer}, heads {unique_heads}"
+            )
 
     # 4. Test-time fine-tuning if requested
     data_module.batch_size = 1
@@ -553,14 +631,14 @@ def run_tx_predict(args: ap.ArgumentParser):
     logger.info(f"Saved adata_pred to {adata_pred_path}")
     logger.info(f"Saved adata_real to {adata_real_path}")
 
-    # Cleanup attention head removal hooks if applied (after inference is done)
-    if 'head_removal_hooks' in locals() and head_removal_hooks:
-        for hook in head_removal_hooks:
+    # Cleanup inference hooks if applied (after inference is done)
+    if 'inference_hooks' in locals() and inference_hooks:
+        for hook in inference_hooks:
             try:
                 hook.remove()
             except Exception:
                 pass
-        logger.info(f"Removed {len(head_removal_hooks)} attention head removal hooks")
+        logger.info(f"Removed {len(inference_hooks)} registered inference hooks")
 
     if not args.predict_only:
         # 6. Compute metrics using cell-eval
