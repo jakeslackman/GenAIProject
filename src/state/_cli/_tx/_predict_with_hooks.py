@@ -452,7 +452,7 @@ def run_tx_predict(args: ap.ArgumentParser):
 
     inference_hooks = []
     captured_hidden_batches = []
-    captured_final_layers_batches = []
+    captured_final_layer_attn_batches = []
 
     # Apply full layer ablation if requested (takes precedence over head removals)
     if args.ablate_layer is not None:
@@ -556,11 +556,11 @@ def run_tx_predict(args: ap.ArgumentParser):
                     inference_hooks.append(hook)
                     logger.info("Registered forward hook to capture final hidden states from last transformer layer")
 
-    # Optionally capture all final transformer layer outputs
+    # Optionally capture self-attention from the final transformer layer
     if getattr(args, "save_all_final_layers", False):
         transformer = getattr(model, "transformer_backbone", None)
         if transformer is None:
-            logger.warning("Model does not expose 'transformer_backbone'; cannot capture all final layer outputs.")
+            logger.warning("Model does not expose 'transformer_backbone'; cannot capture final-layer self-attention.")
         else:
             # Get all transformer layers
             all_layers = []
@@ -568,35 +568,41 @@ def run_tx_predict(args: ap.ArgumentParser):
                 all_layers = transformer.h
             elif hasattr(transformer, "layers") and len(transformer.layers) > 0:
                 all_layers = transformer.layers
-            
-            if len(all_layers) == 0:
-                logger.warning("Could not find any transformer layers; skipping final layers capture.")
-            else:
-                def _capture_all_layers_hook(module, inputs, output):
-                    out = output[0] if isinstance(output, tuple) and len(output) >= 1 else output
-                    if out is None:
-                        return output
-                    try:
-                        out_cpu = out.detach()
-                        if out_cpu.dim() == 3:
-                            # For 3D outputs, flatten to preserve all attention head information
-                            # This gives us [batch, sequence_length * hidden_dim] instead of mean pooling
-                            b, s, h = out_cpu.shape
-                            pooled = out_cpu.reshape(b, s * h)
-                        elif out_cpu.dim() == 2:
-                            pooled = out_cpu
-                        else:
-                            return output
-                        captured_final_layers_batches.append(pooled.cpu())
-                    except Exception as e:
-                        logger.warning(f"Failed to capture final layer output: {e}")
-                    return output
 
-                # Register hooks on all layers
-                for layer_idx, layer in enumerate(all_layers):
-                    hook = layer.register_forward_hook(_capture_all_layers_hook)
+            if len(all_layers) == 0:
+                logger.warning("Could not find any transformer layers; skipping final-layer self-attention capture.")
+            else:
+                final_layer_idx = len(all_layers) - 1
+                final_layer = all_layers[final_layer_idx]
+                attn_module = getattr(final_layer, "attn", getattr(final_layer, "self_attn", None))
+                if attn_module is None:
+                    logger.warning(f"Final layer {final_layer_idx} has no attention module; skipping self-attention capture.")
+                else:
+                    def _capture_final_layer_attn(module, inputs, output):
+                        # Try to capture attention weights if provided; otherwise capture attention output tensor
+                        attn_out = None
+                        attn_weights = None
+                        if isinstance(output, tuple) and len(output) >= 1:
+                            attn_out = output[0]
+                            if len(output) >= 2:
+                                attn_weights = output[1]
+                        else:
+                            attn_out = output
+
+                        try:
+                            if attn_weights is not None and hasattr(attn_weights, "detach"):
+                                captured_final_layer_attn_batches.append(attn_weights.detach().cpu())
+                            elif attn_out is not None and hasattr(attn_out, "detach"):
+                                captured_final_layer_attn_batches.append(attn_out.detach().cpu())
+                            else:
+                                pass
+                        except Exception as e:
+                            logger.warning(f"Failed to capture final-layer self-attention: {e}")
+                        return output
+
+                    hook = attn_module.register_forward_hook(_capture_final_layer_attn)
                     inference_hooks.append(hook)
-                logger.info(f"Registered forward hooks to capture outputs from all {len(all_layers)} transformer layers")
+                    logger.info(f"Registered forward hook to capture self-attention from final transformer layer {final_layer_idx}")
 
     # 4. Test-time fine-tuning if requested
     data_module.batch_size = 1
@@ -673,7 +679,7 @@ def run_tx_predict(args: ap.ArgumentParser):
                 captured_hidden_batches.clear()
             if getattr(args, "save_all_final_layers", False):
                 # Clear any residual captures from prior iterations
-                captured_final_layers_batches.clear()
+                captured_final_layer_attn_batches.clear()
             batch_preds = model.predict_step(batch, batch_idx, padded=False)
 
             # Extract metadata and data directly from batch_preds
@@ -730,29 +736,28 @@ def run_tx_predict(args: ap.ArgumentParser):
                 except Exception as e:
                     logger.warning(f"Failed to store captured final hidden states for batch {batch_idx}: {e}")
 
-            # Capture final layers data if enabled
-            if getattr(args, "save_all_final_layers", False) and len(captured_final_layers_batches) > 0:
+            # Capture final-layer self-attention if enabled
+            if getattr(args, "save_all_final_layers", False) and len(captured_final_layer_attn_batches) > 0:
                 try:
-                    # Stack all layer outputs for this batch: [num_layers, batch_size, hidden_dim]
-                    batch_layers_data = torch.stack([t for t in captured_final_layers_batches], dim=0)
-                    batch_layers_np = batch_layers_data.cpu().numpy().astype(np.float32)
-                    
+                    # Combine captures for this batch along the batch dimension
+                    # Handles either attention weights [B, H, S, S] or attention outputs [B, ...]
+                    batch_attn_data = torch.cat([t for t in captured_final_layer_attn_batches], dim=0)
+                    batch_attn_np = batch_attn_data.cpu().numpy().astype(np.float32)
+
                     if final_layers_data is None:
-                        # Initialize with shape [num_layers, num_cells, hidden_dim]
-                        num_layers = batch_layers_np.shape[0]
-                        hidden_dim = batch_layers_np.shape[-1]
-                        final_layers_data = np.empty((num_layers, num_cells, hidden_dim), dtype=np.float32)
-                    
-                    if batch_layers_np.shape[1] != batch_size:
+                        # Initialize target array with shape [num_cells, ...]
+                        final_layers_data = np.empty((num_cells, *batch_attn_np.shape[1:]), dtype=np.float32)
+
+                    if batch_attn_np.shape[0] != batch_size:
                         logger.warning(
-                            f"Captured final layers rows {batch_layers_np.shape[1]} != preds batch size {batch_size}; aligning by min."
+                            f"Captured final-layer attention rows {batch_attn_np.shape[0]} != preds batch size {batch_size}; aligning by min."
                         )
-                        min_b = min(batch_layers_np.shape[1], batch_size)
-                        final_layers_data[:, current_idx - batch_size : current_idx - batch_size + min_b, :] = batch_layers_np[:, :min_b]
+                        min_b = min(batch_attn_np.shape[0], batch_size)
+                        final_layers_data[current_idx - batch_size : current_idx - batch_size + min_b, ...] = batch_attn_np[:min_b]
                     else:
-                        final_layers_data[:, current_idx - batch_size : current_idx, :] = batch_layers_np
+                        final_layers_data[current_idx - batch_size : current_idx, ...] = batch_attn_np
                 except Exception as e:
-                    logger.warning(f"Failed to store captured final layers data for batch {batch_idx}: {e}")
+                    logger.warning(f"Failed to store captured final-layer self-attention for batch {batch_idx}: {e}")
 
             # Handle X_hvg for HVG space ground truth
             if final_X_hvg is not None:
@@ -893,7 +898,7 @@ def run_tx_predict(args: ap.ArgumentParser):
         except Exception as e:
             logger.warning(f"Failed to save final hidden states .npy: {e}")
 
-    # Optionally save all final layers data as .npy
+    # Optionally save final-layer self-attention data as .npy
     if getattr(args, "save_all_final_layers", False) and final_layers_data is not None:
         try:
             if args.final_layers_output_path is not None:
@@ -905,9 +910,9 @@ def run_tx_predict(args: ap.ArgumentParser):
             os.makedirs(os.path.dirname(final_layers_npy_path), exist_ok=True)
             
             np.save(final_layers_npy_path, final_layers_data)
-            logger.info(f"Saved all final layers data to {final_layers_npy_path} with shape {final_layers_data.shape}")
+            logger.info(f"Saved final-layer self-attention data to {final_layers_npy_path} with shape {final_layers_data.shape}")
 
-            # Save metadata with layer indices and perturbation names
+            # Save metadata with final layer index and perturbation names
             try:
                 if getattr(args, "final_layers_metadata_path", None) is not None:
                     layers_meta_path = args.final_layers_metadata_path
@@ -918,16 +923,25 @@ def run_tx_predict(args: ap.ArgumentParser):
                 if parent:
                     os.makedirs(parent, exist_ok=True)
 
-                num_layers = int(final_layers_data.shape[0])
+                # Determine final layer index for metadata
+                final_layer_index = None
+                transformer = getattr(model, "transformer_backbone", None)
+                if transformer is not None:
+                    if hasattr(transformer, "h") and len(transformer.h) > 0:
+                        final_layer_index = len(transformer.h) - 1
+                    elif hasattr(transformer, "layers") and len(transformer.layers) > 0:
+                        final_layer_index = len(transformer.layers) - 1
+
                 layers_metadata = {
-                    "layers": list(range(num_layers)),
+                    "layer": int(final_layer_index) if final_layer_index is not None else None,
+                    "kind": "self_attention",
                     "perturbations": list(all_pert_names),
                     "array_path": final_layers_npy_path,
                     "shape": [int(x) for x in list(final_layers_data.shape)],
                 }
                 with open(layers_meta_path, "w") as f:
                     json.dump(layers_metadata, f)
-                logger.info(f"Saved final layers metadata to {layers_meta_path}")
+                logger.info(f"Saved final-layer self-attention metadata to {layers_meta_path}")
             except Exception as e:
                 logger.warning(f"Failed to save final layers metadata JSON: {e}")
         except Exception as e:
