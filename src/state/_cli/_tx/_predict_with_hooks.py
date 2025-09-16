@@ -58,6 +58,29 @@ def add_arguments_predict(parser: ap.ArgumentParser):
         help="Custom directory to save results. If not provided, defaults to <output-dir>/eval_<checkpoint-name>/",
     )
 
+    # Save final hidden states (optional)
+    parser.add_argument(
+        "--save-final-hidden",
+        action="store_true",
+        help="If set, capture and save the final transformer layer hidden states to adata_pred.obsm and a .npy file.",
+    )
+    parser.add_argument(
+        "--final-hidden-key",
+        type=str,
+        default="X_final_hidden",
+        help="Key under which to store final hidden states in adata_pred.obsm (default: 'X_final_hidden').",
+    )
+    parser.add_argument(
+        "--final-hidden-pooling",
+        type=str,
+        default="flat",
+        choices=["mean", "cls", "sum", "flat"],
+        help=(
+            "Pooling over sequence when hidden is 3D: 'mean'|'cls'|'sum'|'flat'. "
+            "'flat' flattens [B,S,H] to [B,S*H] to preserve entire final layer."
+        ),
+    )
+
     # Attention head ablation (optional)
     parser.add_argument(
         "--attention-head-layer",
@@ -87,6 +110,33 @@ def add_arguments_predict(parser: ap.ArgumentParser):
         help="Ablate a whole transformer layer by zeroing its output (0-based).",
     )
 
+    # Save all final layers (optional)
+    parser.add_argument(
+        "--save-all-final-layers",
+        action="store_true",
+        help="If set, capture and save all final transformer layer outputs to a .npy file.",
+    )
+    parser.add_argument(
+        "--final-layers-output-path",
+        type=str,
+        default=None,
+        help="Path to save the final layers .npy file. If not provided, defaults to <results-dir>/final_layers.npy",
+    )
+
+    # Metadata output (optional)
+    parser.add_argument(
+        "--final-hidden-metadata-path",
+        type=str,
+        default=None,
+        help="Path to save JSON mapping of rows to perturbation/gene names for final hidden states.",
+    )
+    parser.add_argument(
+        "--final-layers-metadata-path",
+        type=str,
+        default=None,
+        help="Path to save JSON with 'layers' and 'perturbations' for final layers npy.",
+    )
+
 
 def run_tx_predict(args: ap.ArgumentParser):
     import logging
@@ -99,6 +149,7 @@ def run_tx_predict(args: ap.ArgumentParser):
     import pandas as pd
     import torch
     import yaml
+    import json
 
     # Cell-eval for metrics computation
     from cell_eval import MetricsEvaluator
@@ -400,6 +451,8 @@ def run_tx_predict(args: ap.ArgumentParser):
             raise ValueError("--attention-head-layer is required when specifying head indices")
 
     inference_hooks = []
+    captured_hidden_batches = []
+    captured_final_layers_batches = []
 
     # Apply full layer ablation if requested (takes precedence over head removals)
     if args.ablate_layer is not None:
@@ -425,6 +478,125 @@ def run_tx_predict(args: ap.ArgumentParser):
             logger.info(
                 f"Attention head removal enabled: layer {args.attention_head_layer}, heads {unique_heads}"
             )
+
+    # Optionally capture the final transformer hidden states via a forward hook
+    if getattr(args, "save_final_hidden", False):
+        # Prefer capturing the pre-projection representation feeding into project_out,
+        # which should be [batch, hidden] and align with predict_step batch sizes
+        proj_module = getattr(model, "project_out", None)
+        capture_registered = False
+        if proj_module is not None:
+            target_mod = None
+            if hasattr(proj_module, "__getitem__"):
+                try:
+                    target_mod = proj_module[0]
+                except Exception:
+                    target_mod = proj_module
+            else:
+                target_mod = proj_module
+
+            def _capture_preproj_hook(module, inputs):
+                if not inputs:
+                    return None
+                x = inputs[0]
+                try:
+                    captured_hidden_batches.append(x.detach().cpu())
+                except Exception as e:
+                    logger.warning(f"Failed to capture pre-projection hidden state: {e}")
+                return None
+
+            try:
+                hook = target_mod.register_forward_pre_hook(_capture_preproj_hook)
+                inference_hooks.append(hook)
+                capture_registered = True
+                logger.info("Registered pre-hook on project_out to capture pre-projection hidden states")
+            except Exception as e:
+                logger.warning(f"Could not register pre-hook on project_out: {e}")
+
+        if not capture_registered:
+            transformer = getattr(model, "transformer_backbone", None)
+            if transformer is None:
+                logger.warning("Model does not expose 'transformer_backbone'; cannot capture final hidden states.")
+            else:
+                target_layer = None
+                if hasattr(transformer, "h") and len(transformer.h) > 0:
+                    target_layer = transformer.h[-1]
+                elif hasattr(transformer, "layers") and len(transformer.layers) > 0:
+                    target_layer = transformer.layers[-1]
+
+                if target_layer is None:
+                    logger.warning("Could not find final transformer layer; skipping final hidden capture.")
+                else:
+                    def _capture_hidden_hook(module, inputs, output):
+                        out = output[0] if isinstance(output, tuple) and len(output) >= 1 else output
+                        if out is None:
+                            return output
+                        try:
+                            out_cpu = out.detach()
+                            if out_cpu.dim() == 3:
+                                if args.final_hidden_pooling == "cls":
+                                    pooled = out_cpu[:, 0, :]
+                                elif args.final_hidden_pooling == "sum":
+                                    pooled = out_cpu.sum(dim=1)
+                                elif args.final_hidden_pooling == "flat":
+                                    b, s, h = out_cpu.shape
+                                    pooled = out_cpu.reshape(b, s * h)
+                                else:
+                                    pooled = out_cpu.mean(dim=1)
+                            elif out_cpu.dim() == 2:
+                                pooled = out_cpu
+                            else:
+                                return output
+                            captured_hidden_batches.append(pooled.cpu())
+                        except Exception as e:
+                            logger.warning(f"Failed to capture final hidden state: {e}")
+                        return output
+
+                    hook = target_layer.register_forward_hook(_capture_hidden_hook)
+                    inference_hooks.append(hook)
+                    logger.info("Registered forward hook to capture final hidden states from last transformer layer")
+
+    # Optionally capture all final transformer layer outputs
+    if getattr(args, "save_all_final_layers", False):
+        transformer = getattr(model, "transformer_backbone", None)
+        if transformer is None:
+            logger.warning("Model does not expose 'transformer_backbone'; cannot capture all final layer outputs.")
+        else:
+            # Get all transformer layers
+            all_layers = []
+            if hasattr(transformer, "h") and len(transformer.h) > 0:
+                all_layers = transformer.h
+            elif hasattr(transformer, "layers") and len(transformer.layers) > 0:
+                all_layers = transformer.layers
+            
+            if len(all_layers) == 0:
+                logger.warning("Could not find any transformer layers; skipping final layers capture.")
+            else:
+                def _capture_all_layers_hook(module, inputs, output):
+                    out = output[0] if isinstance(output, tuple) and len(output) >= 1 else output
+                    if out is None:
+                        return output
+                    try:
+                        out_cpu = out.detach()
+                        if out_cpu.dim() == 3:
+                            # For 3D outputs, flatten to preserve all attention head information
+                            # This gives us [batch, sequence_length * hidden_dim] instead of mean pooling
+                            b, s, h = out_cpu.shape
+                            pooled = out_cpu.reshape(b, s * h)
+                        elif out_cpu.dim() == 2:
+                            pooled = out_cpu
+                        else:
+                            return output
+                        captured_final_layers_batches.append(pooled.cpu())
+                    except Exception as e:
+                        logger.warning(f"Failed to capture final layer output: {e}")
+                    return output
+
+                # Register hooks on all layers
+                for layer_idx, layer in enumerate(all_layers):
+                    hook = layer.register_forward_hook(_capture_all_layers_hook)
+                    inference_hooks.append(hook)
+                logger.info(f"Registered forward hooks to capture outputs from all {len(all_layers)} transformer layers")
 
     # 4. Test-time fine-tuning if requested
     data_module.batch_size = 1
@@ -488,12 +660,20 @@ def run_tx_predict(args: ap.ArgumentParser):
     all_pert_barcodes = []
     all_ctrl_barcodes = []
 
+    final_hidden = None
+    final_layers_data = None
     with torch.no_grad():
         for batch_idx, batch in enumerate(tqdm(test_loader, desc="Predicting", unit="batch")):
             # Move each tensor in the batch to the model's device
             batch = {k: (v.to(device) if isinstance(v, torch.Tensor) else v) for k, v in batch.items()}
 
             # Get predictions
+            if getattr(args, "save_final_hidden", False):
+                # Clear any residual captures from prior iterations
+                captured_hidden_batches.clear()
+            if getattr(args, "save_all_final_layers", False):
+                # Clear any residual captures from prior iterations
+                captured_final_layers_batches.clear()
             batch_preds = model.predict_step(batch, batch_idx, padded=False)
 
             # Extract metadata and data directly from batch_preds
@@ -531,6 +711,48 @@ def run_tx_predict(args: ap.ArgumentParser):
             final_preds[current_idx : current_idx + batch_size, :] = batch_pred_np
             final_reals[current_idx : current_idx + batch_size, :] = batch_real_np
             current_idx += batch_size
+
+            # Capture final hidden states if enabled
+            if getattr(args, "save_final_hidden", False) and len(captured_hidden_batches) > 0:
+                try:
+                    cat_hidden = torch.cat([t for t in captured_hidden_batches], dim=0)
+                    batch_hidden_np = cat_hidden.cpu().numpy().astype(np.float32)
+                    if final_hidden is None:
+                        final_hidden = np.empty((num_cells, batch_hidden_np.shape[-1]), dtype=np.float32)
+                    if batch_hidden_np.shape[0] != batch_size:
+                        logger.warning(
+                            f"Captured hidden rows {batch_hidden_np.shape[0]} != preds batch size {batch_size}; aligning by min."
+                        )
+                        min_b = min(batch_hidden_np.shape[0], batch_size)
+                        final_hidden[current_idx - batch_size : current_idx - batch_size + min_b, :] = batch_hidden_np[:min_b]
+                    else:
+                        final_hidden[current_idx - batch_size : current_idx, :] = batch_hidden_np
+                except Exception as e:
+                    logger.warning(f"Failed to store captured final hidden states for batch {batch_idx}: {e}")
+
+            # Capture final layers data if enabled
+            if getattr(args, "save_all_final_layers", False) and len(captured_final_layers_batches) > 0:
+                try:
+                    # Stack all layer outputs for this batch: [num_layers, batch_size, hidden_dim]
+                    batch_layers_data = torch.stack([t for t in captured_final_layers_batches], dim=0)
+                    batch_layers_np = batch_layers_data.cpu().numpy().astype(np.float32)
+                    
+                    if final_layers_data is None:
+                        # Initialize with shape [num_layers, num_cells, hidden_dim]
+                        num_layers = batch_layers_np.shape[0]
+                        hidden_dim = batch_layers_np.shape[-1]
+                        final_layers_data = np.empty((num_layers, num_cells, hidden_dim), dtype=np.float32)
+                    
+                    if batch_layers_np.shape[1] != batch_size:
+                        logger.warning(
+                            f"Captured final layers rows {batch_layers_np.shape[1]} != preds batch size {batch_size}; aligning by min."
+                        )
+                        min_b = min(batch_layers_np.shape[1], batch_size)
+                        final_layers_data[:, current_idx - batch_size : current_idx - batch_size + min_b, :] = batch_layers_np[:, :min_b]
+                    else:
+                        final_layers_data[:, current_idx - batch_size : current_idx, :] = batch_layers_np
+                except Exception as e:
+                    logger.warning(f"Failed to store captured final layers data for batch {batch_idx}: {e}")
 
             # Handle X_hvg for HVG space ground truth
             if final_X_hvg is not None:
@@ -590,6 +812,14 @@ def run_tx_predict(args: ap.ArgumentParser):
         # adata_real = anndata.AnnData(X=final_reals, obs=obs, var=var)
         adata_real = anndata.AnnData(X=final_reals, obs=obs)
 
+    # Attach final hidden states if captured
+    if getattr(args, "save_final_hidden", False) and final_hidden is not None:
+        try:
+            adata_pred.obsm[args.final_hidden_key] = final_hidden
+            logger.info(f"Added final hidden states to adata_pred.obsm['{args.final_hidden_key}'] with shape {final_hidden.shape}")
+        except Exception as e:
+            logger.warning(f"Failed to add final hidden states to adata: {e}")
+
     # Optionally filter to perturbations seen in at least one training context
     if args.shared_only:
         try:
@@ -630,6 +860,78 @@ def run_tx_predict(args: ap.ArgumentParser):
 
     logger.info(f"Saved adata_pred to {adata_pred_path}")
     logger.info(f"Saved adata_real to {adata_real_path}")
+
+    # Optionally dump final hidden states as .npy for convenience
+    if getattr(args, "save_final_hidden", False) and final_hidden is not None:
+        try:
+            hidden_npy_path = os.path.join(results_dir, f"{args.final_hidden_key}.npy")
+            np.save(hidden_npy_path, final_hidden)
+            logger.info(f"Saved final hidden states to {hidden_npy_path}")
+
+            # Save metadata mapping rows to perturbation names
+            try:
+                if getattr(args, "final_hidden_metadata_path", None) is not None:
+                    hidden_meta_path = args.final_hidden_metadata_path
+                else:
+                    hidden_meta_path = os.path.join(results_dir, f"{args.final_hidden_key}.meta.json")
+
+                parent = os.path.dirname(hidden_meta_path)
+                if parent:
+                    os.makedirs(parent, exist_ok=True)
+
+                hidden_metadata = {
+                    "perturbations": list(all_pert_names),
+                    "pert_col": data_module.pert_col,
+                    "array_path": hidden_npy_path,
+                    "shape": list(final_hidden.shape),
+                }
+                with open(hidden_meta_path, "w") as f:
+                    json.dump(hidden_metadata, f)
+                logger.info(f"Saved final hidden metadata to {hidden_meta_path}")
+            except Exception as e:
+                logger.warning(f"Failed to save final hidden metadata JSON: {e}")
+        except Exception as e:
+            logger.warning(f"Failed to save final hidden states .npy: {e}")
+
+    # Optionally save all final layers data as .npy
+    if getattr(args, "save_all_final_layers", False) and final_layers_data is not None:
+        try:
+            if args.final_layers_output_path is not None:
+                final_layers_npy_path = args.final_layers_output_path
+            else:
+                final_layers_npy_path = os.path.join(results_dir, "final_layers.npy")
+            
+            # Ensure directory exists
+            os.makedirs(os.path.dirname(final_layers_npy_path), exist_ok=True)
+            
+            np.save(final_layers_npy_path, final_layers_data)
+            logger.info(f"Saved all final layers data to {final_layers_npy_path} with shape {final_layers_data.shape}")
+
+            # Save metadata with layer indices and perturbation names
+            try:
+                if getattr(args, "final_layers_metadata_path", None) is not None:
+                    layers_meta_path = args.final_layers_metadata_path
+                else:
+                    layers_meta_path = os.path.join(results_dir, "final_layers.meta.json")
+
+                parent = os.path.dirname(layers_meta_path)
+                if parent:
+                    os.makedirs(parent, exist_ok=True)
+
+                num_layers = int(final_layers_data.shape[0])
+                layers_metadata = {
+                    "layers": list(range(num_layers)),
+                    "perturbations": list(all_pert_names),
+                    "array_path": final_layers_npy_path,
+                    "shape": [int(x) for x in list(final_layers_data.shape)],
+                }
+                with open(layers_meta_path, "w") as f:
+                    json.dump(layers_metadata, f)
+                logger.info(f"Saved final layers metadata to {layers_meta_path}")
+            except Exception as e:
+                logger.warning(f"Failed to save final layers metadata JSON: {e}")
+        except Exception as e:
+            logger.warning(f"Failed to save final layers .npy: {e}")
 
     # Cleanup inference hooks if applied (after inference is done)
     if 'inference_hooks' in locals() and inference_hooks:
