@@ -453,6 +453,7 @@ def run_tx_predict(args: ap.ArgumentParser):
     inference_hooks = []
     captured_hidden_batches = []
     captured_final_layer_attn_batches = []
+    original_attn_impl = None  # Store original attention implementation
 
     # Apply full layer ablation if requested (takes precedence over head removals)
     if args.ablate_layer is not None:
@@ -562,7 +563,20 @@ def run_tx_predict(args: ap.ArgumentParser):
         if transformer is None:
             logger.warning("Model does not expose 'transformer_backbone'; cannot capture final-layer self-attention.")
         else:
-            # Get all transformer layers
+            # Switch to eager attention implementation to support output_attentions
+            if hasattr(transformer, 'config'):
+                # Store original attention implementation
+                original_attn_impl = getattr(transformer.config, '_attn_implementation', None)
+                if original_attn_impl != 'eager':
+                    transformer.config._attn_implementation = 'eager'
+                    transformer._attn_implementation = 'eager'
+                    logger.info(f"Switched attention implementation from '{original_attn_impl}' to 'eager' for attention capture")
+                
+                # Configure model to output attention weights
+                transformer.config.output_attentions = True
+                logger.info("Set transformer config output_attentions = True")
+            
+            # Also set on individual attention modules
             all_layers = []
             if hasattr(transformer, "h") and len(transformer.h) > 0:
                 all_layers = transformer.h
@@ -572,6 +586,12 @@ def run_tx_predict(args: ap.ArgumentParser):
             if len(all_layers) == 0:
                 logger.warning("Could not find any transformer layers; skipping final-layer self-attention capture.")
             else:
+                # Set output_attentions on all attention modules
+                for layer in all_layers:
+                    attn_module = getattr(layer, "attn", getattr(layer, "self_attn", None))
+                    if attn_module is not None and hasattr(attn_module, 'output_attentions'):
+                        attn_module.output_attentions = True
+                
                 final_layer_idx = len(all_layers) - 1
                 final_layer = all_layers[final_layer_idx]
                 attn_module = getattr(final_layer, "attn", getattr(final_layer, "self_attn", None))
@@ -579,30 +599,39 @@ def run_tx_predict(args: ap.ArgumentParser):
                     logger.warning(f"Final layer {final_layer_idx} has no attention module; skipping self-attention capture.")
                 else:
                     def _capture_final_layer_attn(module, inputs, output):
-                        # Try to capture attention weights if provided; otherwise capture attention output tensor
-                        attn_out = None
+                        # Look for attention weights in the output tuple
+                        # The model should now output (attn_output, attn_weights) when output_attentions=True
                         attn_weights = None
-                        if isinstance(output, tuple) and len(output) >= 1:
-                            attn_out = output[0]
-                            if len(output) >= 2:
-                                attn_weights = output[1]
-                        else:
-                            attn_out = output
+                        
+                        if isinstance(output, tuple):
+                            # Look through all outputs for 4D tensors that look like attention weights [B, H, S, S]
+                            for i, out in enumerate(output):
+                                if hasattr(out, 'shape') and len(out.shape) == 4:
+                                    B, H, S1, S2 = out.shape
+                                    if S1 == S2:  # Square matrix indicates attention weights
+                                        attn_weights = out.detach().cpu()
+                                        logger.debug(f"Found attention weights at output[{i}] with shape: {out.shape}")
+                                        break
+                        elif hasattr(output, 'shape') and len(output.shape) == 4:
+                            # Single 4D tensor output
+                            B, H, S1, S2 = output.shape
+                            if S1 == S2:
+                                attn_weights = output.detach().cpu()
+                                logger.debug(f"Found attention weights with shape: {output.shape}")
 
-                        try:
-                            if attn_weights is not None and hasattr(attn_weights, "detach"):
-                                captured_final_layer_attn_batches.append(attn_weights.detach().cpu())
-                            elif attn_out is not None and hasattr(attn_out, "detach"):
-                                captured_final_layer_attn_batches.append(attn_out.detach().cpu())
-                            else:
-                                pass
-                        except Exception as e:
-                            logger.warning(f"Failed to capture final-layer self-attention: {e}")
+                        if attn_weights is not None:
+                            try:
+                                captured_final_layer_attn_batches.append(attn_weights)
+                                logger.debug(f"Captured attention weights with shape: {attn_weights.shape}")
+                            except Exception as e:
+                                logger.warning(f"Failed to capture attention weights: {e}")
+                        else:
+                            logger.warning("Could not find attention weights in attention module output")
                         return output
 
                     hook = attn_module.register_forward_hook(_capture_final_layer_attn)
                     inference_hooks.append(hook)
-                    logger.info(f"Registered forward hook to capture self-attention from final transformer layer {final_layer_idx}")
+                    logger.info(f"Registered forward hook to capture QK attention matrices from final transformer layer {final_layer_idx}")
 
     # 4. Test-time fine-tuning if requested
     data_module.batch_size = 1
@@ -668,6 +697,7 @@ def run_tx_predict(args: ap.ArgumentParser):
 
     final_hidden = None
     final_layers_data = None
+    attention_to_perturbation_map = []  # List to map attention matrices to perturbations
     with torch.no_grad():
         for batch_idx, batch in enumerate(tqdm(test_loader, desc="Predicting", unit="batch")):
             # Move each tensor in the batch to the model's device
@@ -684,10 +714,13 @@ def run_tx_predict(args: ap.ArgumentParser):
 
             # Extract metadata and data directly from batch_preds
             # Handle pert_name
+            batch_pert_names = []
             if isinstance(batch_preds["pert_name"], list):
                 all_pert_names.extend(batch_preds["pert_name"])
+                batch_pert_names = batch_preds["pert_name"]
             else:
                 all_pert_names.append(batch_preds["pert_name"])
+                batch_pert_names = [batch_preds["pert_name"]]
 
             if "pert_cell_barcode" in batch_preds:
                 if isinstance(batch_preds["pert_cell_barcode"], list):
@@ -745,8 +778,32 @@ def run_tx_predict(args: ap.ArgumentParser):
                     batch_attn_np = batch_attn_data.cpu().numpy().astype(np.float32)
 
                     if final_layers_data is None:
-                        # Initialize target array with shape [num_cells, ...]
-                        final_layers_data = np.empty((num_cells, *batch_attn_np.shape[1:]), dtype=np.float32)
+                        # Initialize target array with shape [num_cells, H, max_seq_len, max_seq_len]
+                        # Use the first batch to determine head dimension and max sequence length
+                        B, H, S, _ = batch_attn_np.shape
+                        max_seq_len = S  # Will be updated as we see larger sequences
+                        final_layers_data = np.zeros((num_cells, H, max_seq_len, max_seq_len), dtype=np.float32)
+                        logger.info(f"Initialized final_layers_data with shape: {final_layers_data.shape}")
+
+                    # Get current dimensions
+                    B, H, S, _ = batch_attn_np.shape
+                    
+                    # Update max sequence length if needed
+                    if S > final_layers_data.shape[2]:
+                        # Resize the array to accommodate larger sequences
+                        old_shape = final_layers_data.shape
+                        new_final_layers_data = np.zeros((num_cells, H, S, S), dtype=np.float32)
+                        new_final_layers_data[:, :, :old_shape[2], :old_shape[3]] = final_layers_data
+                        final_layers_data = new_final_layers_data
+                        logger.info(f"Resized final_layers_data from {old_shape} to {final_layers_data.shape}")
+
+                    # Pad the current batch attention matrices to match the target shape
+                    if S < final_layers_data.shape[2]:
+                        # Pad with zeros to match the target sequence length
+                        padded_batch = np.zeros((B, H, final_layers_data.shape[2], final_layers_data.shape[3]), dtype=np.float32)
+                        padded_batch[:, :, :S, :S] = batch_attn_np
+                        batch_attn_np = padded_batch
+                        logger.debug(f"Padded attention matrices from {S}x{S} to {final_layers_data.shape[2]}x{final_layers_data.shape[3]}")
 
                     if batch_attn_np.shape[0] != batch_size:
                         logger.warning(
@@ -754,8 +811,24 @@ def run_tx_predict(args: ap.ArgumentParser):
                         )
                         min_b = min(batch_attn_np.shape[0], batch_size)
                         final_layers_data[current_idx - batch_size : current_idx - batch_size + min_b, ...] = batch_attn_np[:min_b]
+                        # Map attention matrices to perturbations for this batch
+                        for i in range(min_b):
+                            attention_to_perturbation_map.append({
+                                "tensor_index": current_idx - batch_size + i,
+                                "perturbation": batch_pert_names[i] if i < len(batch_pert_names) else "unknown",
+                                "batch_idx": batch_idx,
+                                "sequence_length": S
+                            })
                     else:
                         final_layers_data[current_idx - batch_size : current_idx, ...] = batch_attn_np
+                        # Map attention matrices to perturbations for this batch
+                        for i in range(batch_size):
+                            attention_to_perturbation_map.append({
+                                "tensor_index": current_idx - batch_size + i,
+                                "perturbation": batch_pert_names[i] if i < len(batch_pert_names) else "unknown",
+                                "batch_idx": batch_idx,
+                                "sequence_length": S
+                            })
                 except Exception as e:
                     logger.warning(f"Failed to store captured final-layer self-attention for batch {batch_idx}: {e}")
 
@@ -910,7 +983,7 @@ def run_tx_predict(args: ap.ArgumentParser):
             os.makedirs(os.path.dirname(final_layers_npy_path), exist_ok=True)
             
             np.save(final_layers_npy_path, final_layers_data)
-            logger.info(f"Saved final-layer self-attention data to {final_layers_npy_path} with shape {final_layers_data.shape}")
+            logger.info(f"Saved QK attention matrices to {final_layers_npy_path} with shape {final_layers_data.shape}")
 
             # Save metadata with final layer index and perturbation names
             try:
@@ -934,14 +1007,19 @@ def run_tx_predict(args: ap.ArgumentParser):
 
                 layers_metadata = {
                     "layer": int(final_layer_index) if final_layer_index is not None else None,
-                    "kind": "self_attention",
+                    "kind": "qk_attention_matrices",
+                    "description": "QK attention weight matrices from final transformer layer [B, H, S, S]. Smaller sequences are padded with zeros.",
                     "perturbations": list(all_pert_names),
                     "array_path": final_layers_npy_path,
                     "shape": [int(x) for x in list(final_layers_data.shape)],
+                    "padding_info": "Sequences shorter than max_seq_len are padded with zeros in the last two dimensions",
+                    "attention_to_perturbation_map": attention_to_perturbation_map,
+                    "mapping_info": "Each entry maps tensor_index to perturbation name, batch_idx, and original sequence_length"
                 }
                 with open(layers_meta_path, "w") as f:
                     json.dump(layers_metadata, f)
-                logger.info(f"Saved final-layer self-attention metadata to {layers_meta_path}")
+                logger.info(f"Saved QK attention matrices metadata to {layers_meta_path}")
+                logger.info(f"Created {len(attention_to_perturbation_map)} attention-to-perturbation mappings")
             except Exception as e:
                 logger.warning(f"Failed to save final layers metadata JSON: {e}")
         except Exception as e:
@@ -955,6 +1033,16 @@ def run_tx_predict(args: ap.ArgumentParser):
             except Exception:
                 pass
         logger.info(f"Removed {len(inference_hooks)} registered inference hooks")
+    
+    # Restore original attention implementation if it was changed
+    if getattr(args, "save_all_final_layers", False) and original_attn_impl is not None:
+        transformer = getattr(model, "transformer_backbone", None)
+        if transformer is not None and hasattr(transformer, 'config'):
+            if original_attn_impl != 'eager':
+                # Restore original implementation
+                transformer.config._attn_implementation = original_attn_impl
+                transformer._attn_implementation = original_attn_impl
+                logger.info(f"Restored attention implementation to '{original_attn_impl}'")
 
     if not args.predict_only:
         # 6. Compute metrics using cell-eval
