@@ -45,6 +45,12 @@ def add_arguments_predict(parser: ap.ArgumentParser):
         default=None,
         help="Path to save the matplotlib heatmap visualization. If not provided, defaults to <results-dir>/position_upregulation_heatmap.png",
     )
+    parser.add_argument(
+        "--shift-batch-size",
+        type=int,
+        default=8,
+        help="Number of position shifts to batch together during heat map generation (default: 8).",
+    )
 
     parser.add_argument(
         "--test-time-finetune",
@@ -878,6 +884,42 @@ def run_tx_predict(args: ap.ArgumentParser):
         tensor[:, index] = tensor[:, index] + shift_value
         core_cells[key] = tensor
 
+    def apply_batched_shifts_to_core_cells(indices: list, upregulate: bool = True):
+        """Apply ±2σ shifts at multiple indices across all vectors in core_cells.
+        
+        Creates multiple copies of core_cells, each with a different position shifted.
+        Returns a list of batched core_cells dicts.
+        
+        - indices: list of integers in [0, D)
+        - upregulate: True for +2σ, False for -2σ
+        """
+        nonlocal core_cells, distributions
+        key = distributions["key"]
+        original_tensor = core_cells[key]
+        
+        batched_core_cells = []
+        for idx in indices:
+            if idx < 0 or idx >= distributions["dim"]:
+                raise ValueError(f"Index {idx} is out of bounds for dimension {distributions['dim']}")
+            
+            # Create a copy of core_cells for this shift
+            shifted_core_cells = {}
+            for k, v in core_cells.items():
+                if isinstance(v, torch.Tensor):
+                    shifted_core_cells[k] = v.clone()
+                else:
+                    shifted_core_cells[k] = v.copy() if hasattr(v, 'copy') else v
+            
+            # Apply the shift to this copy
+            shift_value = (2.0 if upregulate else -2.0) * float(distributions["std"][idx])
+            shifted_tensor = shifted_core_cells[key]
+            shifted_tensor[:, idx] = shifted_tensor[:, idx] + shift_value
+            shifted_core_cells[key] = shifted_tensor
+            
+            batched_core_cells.append(shifted_core_cells)
+        
+        return batched_core_cells
+
     # Optionally apply shift based on CLI flags before running inference
     if args.shift_index is not None:
         if args.shift_direction is None:
@@ -1100,60 +1142,59 @@ def run_tx_predict(args: ap.ArgumentParser):
     # Phase 2: Run inference with each position upregulated (only if requested)
     if args.test_time_heat_map:
         logger.info(f"Phase 2: Running inference with each of {D} positions upregulated...")
+        logger.info(f"Using batch size {args.shift_batch_size} for position shifts")
     
         # Initialize heatmap array: [num_positions, num_perturbations]
         heatmap_distances = np.zeros((D, len(perts_order)), dtype=np.float32)
         
-        # Create a copy of core_cells for upregulation experiments
-        original_core_cells = {}
-        for k, v in core_cells.items():
-            if isinstance(v, torch.Tensor):
-                original_core_cells[k] = v.clone()
-            else:
-                original_core_cells[k] = v.copy() if hasattr(v, 'copy') else v
+        # Create batches of position indices
+        position_batches = []
+        for i in range(0, D, args.shift_batch_size):
+            batch_indices = list(range(i, min(i + args.shift_batch_size, D)))
+            position_batches.append(batch_indices)
         
         with torch.no_grad():
-            for pos_idx in tqdm(range(D), desc="Upregulating positions", unit="pos"):
-                # Apply upregulation to this position
-                apply_shift_to_core_cells(index=pos_idx, upregulate=True)
+            for batch_idx, pos_indices in enumerate(tqdm(position_batches, desc="Batched position shifts", unit="batch")):
+                # Create batched shifted core_cells for all positions in this batch
+                batched_shifted_core_cells = apply_batched_shifts_to_core_cells(pos_indices, upregulate=True)
                 
-                # Run inference for all perturbations with this position upregulated
+                # Run inference for all perturbations with each shifted position
                 for p_idx, pert in enumerate(perts_order):
-                    # Build batch by copying upregulated core_cells
-                    batch = {}
-                    for k, v in core_cells.items():
-                        if isinstance(v, torch.Tensor):
-                            batch[k] = v.to(device)
-                        else:
-                            batch[k] = list(v)
+                    # Collect predictions for all shifts in this batch
+                    batch_upregulated_preds = []
                     
-                    # Overwrite perturbation fields
-                    if "pert_name" in batch:
-                        batch["pert_name"] = [pert for _ in range(target_core_n)]
-                    try:
-                        if "pert_idx" in batch and hasattr(data_module, "get_pert_index"):
-                            idx_val = int(data_module.get_pert_index(pert))
-                            batch["pert_idx"] = torch.tensor([idx_val] * target_core_n, device=device)
-                    except Exception:
-                        pass
+                    for shift_idx, shifted_core_cells in enumerate(batched_shifted_core_cells):
+                        # Build batch by copying this shifted core_cells
+                        batch = {}
+                        for k, v in shifted_core_cells.items():
+                            if isinstance(v, torch.Tensor):
+                                batch[k] = v.to(device)
+                            else:
+                                batch[k] = list(v)
+                        
+                        # Overwrite perturbation fields
+                        if "pert_name" in batch:
+                            batch["pert_name"] = [pert for _ in range(target_core_n)]
+                        try:
+                            if "pert_idx" in batch and hasattr(data_module, "get_pert_index"):
+                                idx_val = int(data_module.get_pert_index(pert))
+                                batch["pert_idx"] = torch.tensor([idx_val] * target_core_n, device=device)
+                        except Exception:
+                            pass
+                        
+                        # Get predictions with upregulated position
+                        batch_preds = model.predict_step(batch, p_idx, padded=False)
+                        upregulated_preds = batch_preds["preds"].detach().cpu().numpy().astype(np.float32)
+                        batch_upregulated_preds.append(upregulated_preds)
                     
-                    # Get predictions with upregulated position
-                    batch_preds = model.predict_step(batch, p_idx, padded=False)
-                    upregulated_preds = batch_preds["preds"].detach().cpu().numpy().astype(np.float32)
-                    
-                    # Compute euclidean distance between normal and upregulated predictions
+                    # Compute distances for all positions in this batch
                     normal_preds = normal_preds_per_pert[pert]  # [64, output_dim]
-                    distance = np.linalg.norm(upregulated_preds - normal_preds, axis=1).mean()  # Mean across 64 cells
-                    heatmap_distances[pos_idx, p_idx] = distance
-                
-                # Restore original core_cells for next position
-                for k, v in original_core_cells.items():
-                    if isinstance(v, torch.Tensor):
-                        core_cells[k] = v.clone()
-                    else:
-                        core_cells[k] = v.copy() if hasattr(v, 'copy') else v
+                    for shift_idx, upregulated_preds in enumerate(batch_upregulated_preds):
+                        pos_idx = pos_indices[shift_idx]
+                        distance = np.linalg.norm(upregulated_preds - normal_preds, axis=1).mean()  # Mean across 64 cells
+                        heatmap_distances[pos_idx, p_idx] = distance
         
-        logger.info("Phase 2 complete: Upregulated inference for all positions.")
+        logger.info("Phase 2 complete: Batched upregulated inference for all positions.")
         
         # Save heatmap data
         try:
