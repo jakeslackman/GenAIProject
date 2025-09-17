@@ -197,6 +197,41 @@ class StateTransitionPerturbationModel(PerturbationModel):
             )
             self.batch_dim = batch_dim
 
+        # Optional batch predictor ablation: learns a single batch token added to every position,
+        # and adds an auxiliary per-token batch classification head + CE loss.
+        self.batch_predictor = bool(kwargs.get("batch_predictor", False))
+        # If batch_encoder is enabled, disable batch_predictor per request
+        if self.batch_encoder is not None and self.batch_predictor:
+            logger.warning(
+                "Both model.kwargs.batch_encoder and model.kwargs.batch_predictor are True. "
+                "Disabling batch_predictor and proceeding with batch_encoder."
+            )
+            self.batch_predictor = False
+            try:
+                # Keep hparams in sync if available
+                self.hparams["batch_predictor"] = False  # type: ignore[index]
+            except Exception:
+                pass
+
+        self.batch_predictor_weight = float(kwargs.get("batch_predictor_weight", 0.1))
+        self.batch_predictor_num_classes: Optional[int] = batch_dim if self.batch_predictor else None
+        if self.batch_predictor:
+            if self.batch_predictor_num_classes is None:
+                raise ValueError("batch_predictor=True requires a valid `batch_dim` (number of batch classes).")
+            # A single learnable batch token that is added to each position
+            self.batch_token = nn.Parameter(torch.randn(1, 1, self.hidden_dim))
+            # Simple per-token classifier from transformer hidden to batch classes
+            self.batch_classifier = build_mlp(
+                in_dim=self.hidden_dim,
+                out_dim=self.batch_predictor_num_classes,
+                hidden_dim=self.hidden_dim,
+                n_layers=4,
+                dropout=self.dropout,
+                activation=self.activation_class,
+            )
+        else:
+            self.batch_token = None
+            self.batch_classifier = None
         # Internal cache for last token features (B, S, H) from transformer for aux loss
         self._token_features: Optional[torch.Tensor] = None
 
