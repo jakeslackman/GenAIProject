@@ -16,6 +16,7 @@ from ._cli import (
     run_tx_predict,
     run_tx_predict_with_hooks,
     run_tx_predict_heat_map,
+    run_tx_test,
     run_tx_preprocess_infer,
     run_tx_preprocess_train,
     run_tx_train,
@@ -131,6 +132,9 @@ def main():
                 case "predict_heat_map":
                     # Run prediction with position upregulation heatmap analysis
                     run_tx_predict_heat_map(args)
+                case "test":
+                    # Run test with GO MF pathway upregulation analysis
+                    run_tx_test(args)
                 case "infer":
                     # Run inference using argparse, similar to predict
                     run_tx_infer(args)

@@ -10,59 +10,6 @@ import pandas as pd
 import anndata as ad
 
 
-def parse_toml_test_perturbations(toml_path: Path) -> List[str]:
-    """
-    Parse TOML file to extract test perturbations from fewshot section.
-    
-    Returns a list of test perturbation gene symbols.
-    """
-    if not toml_path.exists():
-        raise FileNotFoundError(f"TOML file not found: {toml_path}")
-    
-    with open(toml_path, 'r') as f:
-        data = toml.load(f)
-    
-    # Navigate to the fewshot section and extract test perturbations
-    fewshot = data.get('fewshot', {})
-    test_perturbations = []
-    
-    for dataset_key, dataset_config in fewshot.items():
-        if isinstance(dataset_config, dict) and 'test' in dataset_config:
-            test_perturbations.extend(dataset_config['test'])
-    
-    return test_perturbations
-
-
-def create_perturbation_annotation_dict(
-    test_perturbations: List[str],
-    go_maps: Dict[str, Dict[str, Set[str]]]
-) -> Dict[str, Dict[str, Dict[str, List[str]]]]:
-    """
-    Create a dictionary mapping test perturbations to their GO annotations.
-    
-    Returns:
-        Dict mapping perturbation -> annotation_type -> pathway_list
-        Where annotation_type is one of: "bp", "cc", "mf"
-    """
-    perturbation_annotations = {}
-    
-    for perturbation in test_perturbations:
-        perturbation_upper = perturbation.strip().upper()
-        perturbation_annotations[perturbation] = {
-            "bp": [],
-            "cc": [],
-            "mf": []
-        }
-        
-        # Get annotations for each GO type
-        for go_type in ["bp", "cc", "mf"]:
-            if perturbation_upper in go_maps[go_type]:
-                pathways = sorted(go_maps[go_type][perturbation_upper])
-                perturbation_annotations[perturbation][go_type] = pathways
-    
-    return perturbation_annotations
-
-
 def load_go_gene_sets(go_dir: Path) -> Dict[str, Dict[str, Set[str]]]:
     """
     Load GO gene sets from MSigDB JSON exports.
@@ -309,53 +256,9 @@ def main() -> None:
         default=None,
         help="When --input_csv is provided, limit processing to the first N rows",
     )
-    parser.add_argument(
-        "--toml_path",
-        type=Path,
-        default=Path("/data/replogle_nogwps_v2/rpe1.toml"),
-        help="Path to TOML file containing test perturbations",
-    )
-    parser.add_argument(
-        "--output_annotation_dict",
-        type=Path,
-        default=Path("/home/dhruvgautam/state/gene_ontology/test_perturbation_annotations.json"),
-        help="Path to save the test perturbation annotation dictionary as JSON",
-    )
-    parser.add_argument(
-        "--create_annotation_dict_only",
-        action="store_true",
-        help="Only create the annotation dictionary, skip CSV processing",
-    )
     args = parser.parse_args()
 
     go_maps = load_go_gene_sets(args.go_dir)
-    
-    # Parse TOML file and create annotation dictionary for test perturbations
-    test_perturbations = parse_toml_test_perturbations(args.toml_path)
-    print(f"Found {len(test_perturbations)} test perturbations in TOML file")
-    
-    perturbation_annotations = create_perturbation_annotation_dict(test_perturbations, go_maps)
-    
-    # Save annotation dictionary to JSON
-    args.output_annotation_dict.parent.mkdir(parents=True, exist_ok=True)
-    with open(args.output_annotation_dict, 'w') as f:
-        json.dump(perturbation_annotations, f, indent=2)
-    print(f"Saved test perturbation annotations to {args.output_annotation_dict}")
-    
-    # Print summary statistics
-    total_annotated = 0
-    for pert, annotations in perturbation_annotations.items():
-        total_pathways = sum(len(pathways) for pathways in annotations.values())
-        if total_pathways > 0:
-            total_annotated += 1
-            print(f"{pert}: {len(annotations['bp'])} BP, {len(annotations['cc'])} CC, {len(annotations['mf'])} MF pathways")
-    
-    print(f"Summary: {total_annotated}/{len(test_perturbations)} perturbations have GO annotations")
-    
-    # If only creating annotation dictionary, exit here
-    if args.create_annotation_dict_only:
-        return
-    
     # Build feature-index -> gene-symbol mapping from AnnData
     if not args.adata_path.exists():
         raise FileNotFoundError(f"AnnData file not found: {args.adata_path}")
@@ -419,7 +322,6 @@ def main() -> None:
         print(f"Annotated {input_csv} to {output_csv}")
     else:
         # Iterate CSVs in input_dir (non-recursive), skip subdirectories (e.g., ranked_old)
-        csv_count = 0
         for entry in sorted(args.input_dir.iterdir()):
             if entry.is_dir():
                 # Skip subdirectories by default
@@ -428,8 +330,7 @@ def main() -> None:
                 continue
             output_csv = args.output_dir / entry.name
             annotate_ranked_file(entry, output_csv, go_maps, gene_mapping)
-            csv_count += 1
-        print(f"Annotated {csv_count} CSV files from {args.input_dir}")
+    print(f"Annotated {len(args.input_csv)} CSV files and {len(args.input_dir)} directories.")
 
 
 if __name__ == "__main__":

@@ -28,6 +28,8 @@ dependencies = [
     "transformers>=4.52.3",
     "cell-eval>=0.5.22",
     "ipykernel>=6.30.1",
+    "matplotlib>=3.8.0",
+    "lightning>=2.0.0",
 ]
 
 [project.optional-dependencies]

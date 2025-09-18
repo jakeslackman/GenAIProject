@@ -463,36 +463,6 @@ def run_tx_predict(args: ap.ArgumentParser):
     logger.info("Generating predictions: one forward pass per perturbation on core_cells...")
     device = next(model.parameters()).device
 
-    # Prepare perturbation one-hot/embedding map for the pert encoder
-    pert_onehot_map = getattr(data_module, "pert_onehot_map", None)
-    if pert_onehot_map is None:
-        try:
-            map_path = os.path.join(run_output_dir, "pert_onehot_map.pt")
-            if os.path.exists(map_path):
-                pert_onehot_map = torch.load(map_path, weights_only=False)
-            else:
-                logger.warning(f"pert_onehot_map.pt not found at {map_path}; proceeding without explicit pert_emb overrides")
-                pert_onehot_map = {}
-        except Exception as e:
-            logger.warning(f"Failed to load pert_onehot_map.pt: {e}")
-            pert_onehot_map = {}
-
-    def _prepare_pert_emb(pert_name: str, length: int, device: torch.device):
-        vec = None
-        try:
-            vec = pert_onehot_map.get(pert_name, None)
-            if vec is None and control_pert in pert_onehot_map:
-                vec = pert_onehot_map[control_pert]
-        except Exception:
-            vec = None
-        if vec is None:
-            # Fallback to zeros with model.pert_dim if mapping is unavailable
-            pert_dim = getattr(model, "pert_dim", var_dims.get("pert_dim", 0))
-            if pert_dim <= 0:
-                raise RuntimeError("Could not determine pert_dim to build pert_emb")
-            vec = torch.zeros(pert_dim)
-        return vec.float().unsqueeze(0).repeat(length, 1).to(device)
-
     # Phase 1: Normal inference on all perturbations
     final_preds = np.empty((num_cells, output_dim), dtype=np.float32)
     final_reals = np.empty((num_cells, output_dim), dtype=np.float32)
@@ -546,9 +516,6 @@ def run_tx_predict(args: ap.ArgumentParser):
                     batch["pert_idx"] = torch.tensor([idx_val] * target_core_n, device=device)
             except Exception:
                 pass
-
-            # Ensure perturbation embedding is set for the encoder
-            batch["pert_emb"] = _prepare_pert_emb(pert, target_core_n, device)
 
             batch_preds = model.predict_step(batch, p_idx, padded=False)
 
@@ -621,7 +588,7 @@ def run_tx_predict(args: ap.ArgumentParser):
         pathway_to_genes = defaultdict(list)
         
         for idx, data in gene_annotations.items():
-            mf_paths = data['go_mf_paths']
+            mf_paths = data['go_cc_paths']
             if mf_paths:  # If gene has MF pathways
                 pathways = mf_paths.split(';')
                 for pathway in pathways:
@@ -647,17 +614,11 @@ def run_tx_predict(args: ap.ArgumentParser):
             else:
                 original_core_cells[k] = v.copy() if hasattr(v, 'copy') else v
         
-        def apply_pathway_shift_to_core_cells(gene_indices: list, upregulate: bool, target_norm: float = 2.0):
-            """Apply shift to multiple gene indices with equivalent euclidean norm across pathways.
-            
-            This function ensures that all pathways receive the same euclidean norm perturbation:
-            1. Compute individual shifts based on 2σ for each gene
-            2. Calculate the euclidean norm of the shift vector
-            3. Rescale the entire shift vector to match the target euclidean norm
+        def apply_pathway_shift_to_core_cells(gene_indices: list, upregulate: bool):
+            """Apply ±2σ shift to multiple gene indices across all vectors in core_cells.
             
             - gene_indices: list of 0-indexed gene positions
-            - upregulate: True for positive shift, False for negative shift
-            - target_norm: target euclidean norm for the perturbation (default: 2.0)
+            - upregulate: True for +2σ, False for -2σ
             Operates in-place on the tensor stored at distributions['key'] inside core_cells.
             """
             nonlocal core_cells, distributions
@@ -666,36 +627,9 @@ def run_tx_predict(args: ap.ArgumentParser):
             if not isinstance(tensor, torch.Tensor) or tensor.dim() != 2:
                 raise RuntimeError(f"Core cell field '{key}' is not a 2D tensor")
             
-            if len(gene_indices) == 0:
-                return
-            
-            # Step 1: Compute raw shift values based on 2σ for each gene
-            raw_shifts = {}
             for idx in gene_indices:
                 if 0 <= idx < distributions["dim"]:
-                    base_shift = 2.0 * float(distributions["std"][idx])
-                    raw_shifts[idx] = base_shift if upregulate else -base_shift
-            
-            if len(raw_shifts) == 0:
-                return
-                
-            # Step 2: Calculate euclidean norm of the raw shift vector
-            shift_values = np.array(list(raw_shifts.values()))
-            current_norm = np.linalg.norm(shift_values)
-            
-            # Step 3: Rescale to target norm if current norm > 0
-            if current_norm > 1e-8:  # Avoid division by zero
-                scale_factor = target_norm / current_norm
-                
-                # Apply rescaled shifts
-                for idx, raw_shift in raw_shifts.items():
-                    scaled_shift = raw_shift * scale_factor
-                    tensor[:, idx] = tensor[:, idx] + scaled_shift
-            else:
-                # Fallback: if all std deviations are zero, apply uniform shift
-                uniform_shift = target_norm / np.sqrt(len(raw_shifts))
-                for idx in raw_shifts.keys():
-                    shift_value = uniform_shift if upregulate else -uniform_shift
+                    shift_value = (2.0 if upregulate else -2.0) * float(distributions["std"][idx])
                     tensor[:, idx] = tensor[:, idx] + shift_value
         
         with torch.no_grad():
@@ -722,9 +656,6 @@ def run_tx_predict(args: ap.ArgumentParser):
                             batch["pert_idx"] = torch.tensor([idx_val] * target_core_n, device=device)
                     except Exception:
                         pass
-
-                    # Ensure perturbation embedding is set for the encoder
-                    batch["pert_emb"] = _prepare_pert_emb(pert, target_core_n, device)
                     
                     # Get predictions with upregulated pathway
                     batch_preds = model.predict_step(batch, p_idx, padded=False)
@@ -753,11 +684,11 @@ def run_tx_predict(args: ap.ArgumentParser):
                 results_dir = os.path.join(args.output_dir, "eval_" + os.path.basename(args.checkpoint))
             os.makedirs(results_dir, exist_ok=True)
             
-            heatmap_path = os.path.join(results_dir, "go_mf_pathway_upregulation_heatmap.npy")
+            heatmap_path = os.path.join(results_dir, "go_cc_pathway_upregulation_heatmap.npy")
             np.save(heatmap_path, heatmap_distances)
             
             # Save pathway information
-            pathway_info_path = os.path.join(results_dir, "go_mf_pathways_info.json")
+            pathway_info_path = os.path.join(results_dir, "go_cc_pathways_info.json")
             pathway_info = {
                 "pathway_names": pathway_names,
                 "pathway_to_genes": {pathway: genes for pathway, genes in filtered_pathways.items()},
@@ -775,9 +706,9 @@ def run_tx_predict(args: ap.ArgumentParser):
                 "perturbations": perts_order,
                 "pathway_names": pathway_names,
                 "distance_type": "mean_euclidean_norm_across_64_cells",
-                "upregulation": "equivalent_euclidean_norm_perturbation_rescaled_from_2std_per_gene"
+                "upregulation": "2_std_deviation_shift_per_pathway_group"
             }
-            heatmap_meta_path = os.path.join(results_dir, "go_mf_pathway_upregulation_heatmap.meta.json")
+            heatmap_meta_path = os.path.join(results_dir, "go_cc_pathway_upregulation_heatmap.meta.json")
             with open(heatmap_meta_path, "w") as f:
                 json.dump(heatmap_meta, f, indent=2)
             
@@ -792,7 +723,7 @@ def run_tx_predict(args: ap.ArgumentParser):
             if args.heatmap_output_path is not None:
                 heatmap_img_path = args.heatmap_output_path
             else:
-                heatmap_img_path = os.path.join(results_dir, "go_mf_pathway_upregulation_heatmap.png")
+                heatmap_img_path = os.path.join(results_dir, "go_cc_pathway_upregulation_heatmap.png")
             
             # Ensure directory exists
             os.makedirs(os.path.dirname(heatmap_img_path), exist_ok=True)

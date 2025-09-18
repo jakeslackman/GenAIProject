@@ -48,8 +48,19 @@ def add_arguments_predict(parser: ap.ArgumentParser):
     parser.add_argument(
         "--shift-batch-size",
         type=int,
-        default=8,
+        default=1,
         help="Number of position shifts to batch together during heat map generation (default: 8).",
+    )
+    parser.add_argument(
+        "--num-gpus",
+        type=int,
+        default=1,
+        help="Number of GPUs to use for parallel processing (default: 1).",
+    )
+    parser.add_argument(
+        "--gpu-parallel",
+        action="store_true",
+        help="Enable multi-GPU parallelization for heat map generation.",
     )
 
     parser.add_argument(
@@ -175,6 +186,8 @@ def run_tx_predict(args: ap.ArgumentParser):
     import logging
     import os
     import sys
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+    import multiprocessing as mp
 
     import anndata
     import lightning.pytorch as pl
@@ -866,17 +879,34 @@ def run_tx_predict(args: ap.ArgumentParser):
         "num_cells": int(control_vectors_all.shape[0]),
     }
 
-    def apply_shift_to_core_cells(index: int, upregulate: bool):
-        """Apply ±2σ shift at a single index across all vectors in core_cells.
+    def apply_shift_to_core_cells(index: int, upregulate: bool, target_norm: float = 2.0):
+        """Apply shift at a single index with equivalent euclidean norm across positions.
 
+        This function ensures that all individual position shifts have the same euclidean norm:
+        1. Compute shift based on 2σ for the gene
+        2. Scale the shift to match the target euclidean norm
+        
         - index: integer in [0, D)
-        - upregulate: True for +2σ, False for -2σ
+        - upregulate: True for positive shift, False for negative shift
+        - target_norm: target euclidean norm for the perturbation (default: 2.0)
         Operates in-place on the tensor stored at distributions['key'] inside core_cells.
         """
         nonlocal core_cells, distributions
         if index < 0 or index >= distributions["dim"]:
             raise ValueError(f"Index {index} is out of bounds for dimension {distributions['dim']}")
-        shift_value = (2.0 if upregulate else -2.0) * float(distributions["std"][index])
+        
+        # Compute raw shift based on 2σ
+        base_shift = 2.0 * float(distributions["std"][index])
+        raw_shift = base_shift if upregulate else -base_shift
+        
+        # Scale to target norm (for single position, the norm is just the absolute value)
+        if abs(raw_shift) > 1e-8:  # Avoid division by zero
+            scale_factor = target_norm / abs(raw_shift)
+            shift_value = raw_shift * scale_factor
+        else:
+            # Fallback: if std deviation is zero, apply uniform shift
+            shift_value = target_norm if upregulate else -target_norm
+        
         key = distributions["key"]
         tensor = core_cells[key]
         if not isinstance(tensor, torch.Tensor) or tensor.dim() != 2:
@@ -884,14 +914,16 @@ def run_tx_predict(args: ap.ArgumentParser):
         tensor[:, index] = tensor[:, index] + shift_value
         core_cells[key] = tensor
 
-    def apply_batched_shifts_to_core_cells(indices: list, upregulate: bool = True):
-        """Apply ±2σ shifts at multiple indices across all vectors in core_cells.
+    def apply_batched_shifts_to_core_cells(indices: list, upregulate: bool = True, target_norm: float = 2.0):
+        """Apply shifts at multiple indices with equivalent euclidean norm across positions.
         
         Creates multiple copies of core_cells, each with a different position shifted.
+        Each shift is normalized to have the same euclidean norm.
         Returns a list of batched core_cells dicts.
         
         - indices: list of integers in [0, D)
-        - upregulate: True for +2σ, False for -2σ
+        - upregulate: True for positive shift, False for negative shift
+        - target_norm: target euclidean norm for each perturbation (default: 2.0)
         """
         nonlocal core_cells, distributions
         key = distributions["key"]
@@ -910,8 +942,18 @@ def run_tx_predict(args: ap.ArgumentParser):
                 else:
                     shifted_core_cells[k] = v.copy() if hasattr(v, 'copy') else v
             
-            # Apply the shift to this copy
-            shift_value = (2.0 if upregulate else -2.0) * float(distributions["std"][idx])
+            # Compute raw shift based on 2σ
+            base_shift = 2.0 * float(distributions["std"][idx])
+            raw_shift = base_shift if upregulate else -base_shift
+            
+            # Scale to target norm (for single position, the norm is just the absolute value)
+            if abs(raw_shift) > 1e-8:  # Avoid division by zero
+                scale_factor = target_norm / abs(raw_shift)
+                shift_value = raw_shift * scale_factor
+            else:
+                # Fallback: if std deviation is zero, apply uniform shift
+                shift_value = target_norm if upregulate else -target_norm
+            
             shifted_tensor = shifted_core_cells[key]
             shifted_tensor[:, idx] = shifted_tensor[:, idx] + shift_value
             shifted_core_cells[key] = shifted_tensor
@@ -919,6 +961,112 @@ def run_tx_predict(args: ap.ArgumentParser):
             batched_core_cells.append(shifted_core_cells)
         
         return batched_core_cells
+
+    def process_position_batch_on_gpu(gpu_id, position_indices, perts_order, core_cells_copy, distributions_copy, 
+                                    normal_preds_per_pert, model_class, model_kwargs, checkpoint_path, 
+                                    data_module, target_core_n, var_dims, pert_onehot_map):
+        """Process a batch of position indices on a specific GPU.
+        
+        Returns a dictionary mapping (pos_idx, pert_idx) -> distance
+        """
+        import torch
+        import numpy as np
+        from tqdm import tqdm
+        
+        print(f"GPU {gpu_id}: Function called with {len(position_indices)} positions", flush=True)
+        
+        # Set the GPU device
+        device = torch.device(f'cuda:{gpu_id}')
+        torch.cuda.set_device(device)
+        print(f"GPU {gpu_id}: Device set to {device}", flush=True)
+        
+        # Load model on this GPU
+        print(f"GPU {gpu_id}: Loading model...", flush=True)
+        model = model_class.load_from_checkpoint(checkpoint_path, **model_kwargs)
+        model = model.to(device)
+        model.eval()
+        print(f"GPU {gpu_id}: Model loaded and set to eval mode", flush=True)
+        
+        results = {}
+        
+        def apply_shift_to_core_cells_local(index: int, upregulate: bool, core_cells_local, distributions_local, target_norm: float = 2.0):
+            """Local version of apply_shift_to_core_cells with equivalent euclidean norm"""
+            if index < 0 or index >= distributions_local["dim"]:
+                raise ValueError(f"Index {index} is out of bounds for dimension {distributions_local['dim']}")
+            
+            # Compute raw shift based on 2σ
+            base_shift = 2.0 * float(distributions_local["std"][index])
+            raw_shift = base_shift if upregulate else -base_shift
+            
+            # Scale to target norm (for single position, the norm is just the absolute value)
+            if abs(raw_shift) > 1e-8:  # Avoid division by zero
+                scale_factor = target_norm / abs(raw_shift)
+                shift_value = raw_shift * scale_factor
+            else:
+                # Fallback: if std deviation is zero, apply uniform shift
+                shift_value = target_norm if upregulate else -target_norm
+            
+            key = distributions_local["key"]
+            tensor = core_cells_local[key]
+            if not isinstance(tensor, torch.Tensor) or tensor.dim() != 2:
+                raise RuntimeError(f"Core cell field '{key}' is not a 2D tensor")
+            tensor[:, index] = tensor[:, index] + shift_value
+            return tensor
+        
+        print(f"GPU {gpu_id}: Starting processing of {len(position_indices)} positions", flush=True)
+        
+        with torch.no_grad():
+            for pos_idx in position_indices:
+                # Create a copy of core_cells for this position
+                shifted_core_cells = {}
+                for k, v in core_cells_copy.items():
+                    if isinstance(v, torch.Tensor):
+                        shifted_core_cells[k] = v.clone()
+                    else:
+                        shifted_core_cells[k] = v.copy() if hasattr(v, 'copy') else v
+                
+                # Apply the shift to this copy
+                apply_shift_to_core_cells_local(pos_idx, True, shifted_core_cells, distributions_copy)
+                
+                for p_idx, pert in enumerate(perts_order):
+                    # Build batch by copying shifted core_cells
+                    batch = {}
+                    for k, v in shifted_core_cells.items():
+                        if isinstance(v, torch.Tensor):
+                            batch[k] = v.to(device)
+                        else:
+                            batch[k] = list(v)
+                    
+                    # Overwrite perturbation fields
+                    if "pert_name" in batch:
+                        batch["pert_name"] = [pert for _ in range(target_core_n)]
+                    try:
+                        if "pert_idx" in batch and hasattr(data_module, "get_pert_index"):
+                            idx_val = int(data_module.get_pert_index(pert))
+                            batch["pert_idx"] = torch.tensor([idx_val] * target_core_n, device=device)
+                    except Exception:
+                        pass
+                    
+                    # Get predictions with upregulated position
+                    batch_preds = model.predict_step(batch, p_idx, padded=False)
+                    upregulated_preds = batch_preds["preds"].detach().cpu().numpy().astype(np.float32)
+                    
+                    # Compute distance
+                    normal_preds = normal_preds_per_pert[pert]  # [64, output_dim]
+                    distance = np.linalg.norm(upregulated_preds - normal_preds, axis=1).mean()
+                    results[(pos_idx, p_idx)] = distance
+                
+                # Log progress every 50 positions
+                if (position_indices.index(pos_idx) + 1) % 50 == 0:
+                    print(f"GPU {gpu_id}: Completed {position_indices.index(pos_idx) + 1}/{len(position_indices)} positions", flush=True)
+        
+        print(f"GPU {gpu_id}: Completed all {len(position_indices)} positions", flush=True)
+        
+        # Clean up GPU memory
+        del model
+        torch.cuda.empty_cache()
+        
+        return results
 
     # Optionally apply shift based on CLI flags before running inference
     if args.shift_index is not None:
@@ -937,6 +1085,36 @@ def run_tx_predict(args: ap.ArgumentParser):
 
     logger.info("Generating predictions: one forward pass per perturbation on core_cells...")
     device = next(model.parameters()).device
+
+    # Prepare perturbation one-hot/embedding map for the pert encoder
+    pert_onehot_map = getattr(data_module, "pert_onehot_map", None)
+    if pert_onehot_map is None:
+        try:
+            map_path = os.path.join(run_output_dir, "pert_onehot_map.pt")
+            if os.path.exists(map_path):
+                pert_onehot_map = torch.load(map_path, weights_only=False)
+            else:
+                logger.warning(f"pert_onehot_map.pt not found at {map_path}; proceeding without explicit pert_emb overrides")
+                pert_onehot_map = {}
+        except Exception as e:
+            logger.warning(f"Failed to load pert_onehot_map.pt: {e}")
+            pert_onehot_map = {}
+
+    def _prepare_pert_emb(pert_name: str, length: int, device: torch.device):
+        vec = None
+        try:
+            vec = pert_onehot_map.get(pert_name, None)
+            if vec is None and control_pert in pert_onehot_map:
+                vec = pert_onehot_map[control_pert]
+        except Exception:
+            vec = None
+        if vec is None:
+            # Fallback to zeros with model.pert_dim if mapping is unavailable
+            pert_dim = getattr(model, "pert_dim", var_dims.get("pert_dim", 0))
+            if pert_dim <= 0:
+                raise RuntimeError("Could not determine pert_dim to build pert_emb")
+            vec = torch.zeros(pert_dim)
+        return vec.float().unsqueeze(0).repeat(length, 1).to(device)
 
     # Phase 1: Normal inference on all perturbations
     final_preds = np.empty((num_cells, output_dim), dtype=np.float32)
@@ -994,6 +1172,9 @@ def run_tx_predict(args: ap.ArgumentParser):
                     batch["pert_idx"] = torch.tensor([idx_val] * target_core_n, device=device)
             except Exception:
                 pass
+
+            # Ensure perturbation embedding is set for the encoder
+            batch["pert_emb"] = _prepare_pert_emb(pert, target_core_n, device)
 
                 # Clear any residual captures from prior iterations
             if getattr(args, "save_final_hidden", False):
@@ -1142,62 +1323,166 @@ def run_tx_predict(args: ap.ArgumentParser):
     # Phase 2: Run inference with each position upregulated (only if requested)
     if args.test_time_heat_map:
         logger.info(f"Phase 2: Running inference with each of {D} positions upregulated...")
-        logger.info(f"Using batch size {args.shift_batch_size} for position shifts")
-    
+        
         # Initialize heatmap array: [num_positions, num_perturbations]
         heatmap_distances = np.zeros((D, len(perts_order)), dtype=np.float32)
         
-        # Create batches of position indices
-        position_batches = []
-        for i in range(0, D, args.shift_batch_size):
-            batch_indices = list(range(i, min(i + args.shift_batch_size, D)))
-            position_batches.append(batch_indices)
-        
-        with torch.no_grad():
-            for batch_idx, pos_indices in enumerate(tqdm(position_batches, desc="Batched position shifts", unit="batch")):
-                # Create batched shifted core_cells for all positions in this batch
-                batched_shifted_core_cells = apply_batched_shifts_to_core_cells(pos_indices, upregulate=True)
+        if args.gpu_parallel and args.num_gpus > 1:
+            logger.info(f"Using {args.num_gpus} GPUs for parallel processing")
+            
+            # Check available GPUs
+            available_gpus = torch.cuda.device_count()
+            if available_gpus < args.num_gpus:
+                logger.warning(f"Requested {args.num_gpus} GPUs but only {available_gpus} available. Using {available_gpus} GPUs.")
+                num_gpus = available_gpus
+            else:
+                num_gpus = args.num_gpus
+            
+            # Distribute positions across GPUs
+            positions_per_gpu = D // num_gpus
+            remainder = D % num_gpus
+            
+            gpu_position_batches = []
+            start_pos = 0
+            for gpu_id in range(num_gpus):
+                # Add one extra position to first 'remainder' GPUs
+                end_pos = start_pos + positions_per_gpu + (1 if gpu_id < remainder else 0)
+                gpu_positions = list(range(start_pos, end_pos))
+                gpu_position_batches.append((gpu_id, gpu_positions))
+                start_pos = end_pos
+            
+            logger.info(f"Distributed {D} positions across {num_gpus} GPUs")
+            for gpu_id, positions in gpu_position_batches:
+                logger.info(f"  GPU {gpu_id}: positions {positions[0]}-{positions[-1]} ({len(positions)} positions)")
+            
+            # Process in parallel using ThreadPoolExecutor
+            all_results = {}
+            logger.info(f"Starting parallel processing with {num_gpus} GPUs...")
+            with ThreadPoolExecutor(max_workers=num_gpus) as executor:
+                # Submit tasks to each GPU
+                future_to_gpu = {}
+                for gpu_id, gpu_positions in gpu_position_batches:
+                    logger.info(f"Preparing data for GPU {gpu_id}...")
+                    # Create copies of data for this GPU
+                    core_cells_copy = {}
+                    for k, v in core_cells.items():
+                        if isinstance(v, torch.Tensor):
+                            core_cells_copy[k] = v.clone()
+                        else:
+                            core_cells_copy[k] = v.copy() if hasattr(v, 'copy') else v
+                    
+                    distributions_copy = {
+                        "key": distributions["key"],
+                        "mean": distributions["mean"].copy(),
+                        "std": distributions["std"].copy(),
+                        "dim": distributions["dim"],
+                        "num_cells": distributions["num_cells"]
+                    }
+                    
+                    # Create a copy of normal_preds_per_pert for this GPU
+                    normal_preds_copy = {}
+                    for pert, preds in normal_preds_per_pert.items():
+                        normal_preds_copy[pert] = preds.copy()
+                    
+                    logger.info(f"Submitting task for GPU {gpu_id}...")
+                    future = executor.submit(
+                        process_position_batch_on_gpu,
+                        gpu_id, gpu_positions, perts_order, core_cells_copy, distributions_copy,
+                        normal_preds_copy, ModelClass, model_init_kwargs, checkpoint_path,
+                        data_module, target_core_n, var_dims, pert_onehot_map
+                    )
+                    future_to_gpu[future] = gpu_id
+                    logger.info(f"Task submitted for GPU {gpu_id}")
                 
-                # Run inference for all perturbations with each shifted position
-                for p_idx, pert in enumerate(perts_order):
-                    # Collect predictions for all shifts in this batch
-                    batch_upregulated_preds = []
+                # Collect results as they complete
+                logger.info("Waiting for GPU processing to complete...")
+                completed_count = 0
+                for future in future_to_gpu:
+                    gpu_id = future_to_gpu[future]
+                    try:
+                        logger.info(f"Waiting for GPU {gpu_id} to complete...")
+                        # Add timeout to prevent hanging
+                        gpu_results = future.result(timeout=3600)  # 1 hour timeout
+                        all_results.update(gpu_results)
+                        completed_count += 1
+                        logger.info(f"GPU {gpu_id} completed processing with {len(gpu_results)} results ({completed_count}/{len(future_to_gpu)} GPUs done)")
+                    except Exception as e:
+                        logger.error(f"GPU {gpu_id} failed: {e}")
+                        import traceback
+                        logger.error(f"Full traceback: {traceback.format_exc()}")
+                        # Cancel remaining futures
+                        for f in future_to_gpu:
+                            f.cancel()
+                        raise
+            
+            # Populate heatmap_distances from results
+            for (pos_idx, p_idx), distance in all_results.items():
+                heatmap_distances[pos_idx, p_idx] = distance
+                
+        else:
+            # Single GPU processing (original logic)
+            logger.info(f"Using single GPU with batch size {args.shift_batch_size} for position shifts")
+            
+            # Create batches of position indices
+            position_batches = []
+            for i in range(0, D, args.shift_batch_size):
+                batch_indices = list(range(i, min(i + args.shift_batch_size, D)))
+                position_batches.append(batch_indices)
+            
+            with torch.no_grad():
+                for batch_idx, pos_indices in enumerate(tqdm(position_batches, desc="Batched position shifts", unit="batch")):
+                    # Create batched shifted core_cells for all positions in this batch
+                    batched_shifted_core_cells = apply_batched_shifts_to_core_cells(pos_indices, upregulate=True)
                     
-                    for shift_idx, shifted_core_cells in enumerate(batched_shifted_core_cells):
-                        # Build batch by copying this shifted core_cells
-                        batch = {}
-                        for k, v in shifted_core_cells.items():
-                            if isinstance(v, torch.Tensor):
-                                batch[k] = v.to(device)
-                            else:
-                                batch[k] = list(v)
+                    # Run inference for all perturbations with each shifted position
+                    for p_idx, pert in enumerate(perts_order):
+                        # Collect predictions for all shifts in this batch
+                        batch_upregulated_preds = []
                         
-                        # Overwrite perturbation fields
-                        if "pert_name" in batch:
-                            batch["pert_name"] = [pert for _ in range(target_core_n)]
-                        try:
-                            if "pert_idx" in batch and hasattr(data_module, "get_pert_index"):
-                                idx_val = int(data_module.get_pert_index(pert))
-                                batch["pert_idx"] = torch.tensor([idx_val] * target_core_n, device=device)
-                        except Exception:
-                            pass
+                        for shift_idx, shifted_core_cells in enumerate(batched_shifted_core_cells):
+                            # Build batch by copying this shifted core_cells
+                            batch = {}
+                            for k, v in shifted_core_cells.items():
+                                if isinstance(v, torch.Tensor):
+                                    batch[k] = v.to(device)
+                                else:
+                                    batch[k] = list(v)
+                            
+                            # Overwrite perturbation fields
+                            if "pert_name" in batch:
+                                batch["pert_name"] = [pert for _ in range(target_core_n)]
+                            try:
+                                if "pert_idx" in batch and hasattr(data_module, "get_pert_index"):
+                                    idx_val = int(data_module.get_pert_index(pert))
+                                    batch["pert_idx"] = torch.tensor([idx_val] * target_core_n, device=device)
+                            except Exception:
+                                pass
+                            
+                            # Ensure perturbation embedding is set for the encoder
+                            batch["pert_emb"] = _prepare_pert_emb(pert, target_core_n, device)
+
+                            # Get predictions with upregulated position
+                            batch_preds = model.predict_step(batch, p_idx, padded=False)
+                            upregulated_preds = batch_preds["preds"].detach().cpu().numpy().astype(np.float32)
+                            batch_upregulated_preds.append(upregulated_preds)
                         
-                        # Get predictions with upregulated position
-                        batch_preds = model.predict_step(batch, p_idx, padded=False)
-                        upregulated_preds = batch_preds["preds"].detach().cpu().numpy().astype(np.float32)
-                        batch_upregulated_preds.append(upregulated_preds)
-                    
-                    # Compute distances for all positions in this batch
-                    normal_preds = normal_preds_per_pert[pert]  # [64, output_dim]
-                    for shift_idx, upregulated_preds in enumerate(batch_upregulated_preds):
-                        pos_idx = pos_indices[shift_idx]
-                        distance = np.linalg.norm(upregulated_preds - normal_preds, axis=1).mean()  # Mean across 64 cells
-                        heatmap_distances[pos_idx, p_idx] = distance
+                        # Compute distances for all positions in this batch
+                        normal_preds = normal_preds_per_pert[pert]  # [64, output_dim]
+                        for shift_idx, upregulated_preds in enumerate(batch_upregulated_preds):
+                            pos_idx = pos_indices[shift_idx]
+                            distance = np.linalg.norm(upregulated_preds - normal_preds, axis=1).mean()  # Mean across 64 cells
+                            heatmap_distances[pos_idx, p_idx] = distance
         
         logger.info("Phase 2 complete: Batched upregulated inference for all positions.")
         
         # Save heatmap data
         try:
+            if args.results_dir is not None:
+                results_dir = args.results_dir
+            else:
+                results_dir = os.path.join(args.output_dir, "eval_" + os.path.basename(args.checkpoint))
+            os.makedirs(results_dir, exist_ok=True)
+            
             heatmap_path = os.path.join(results_dir, "position_upregulation_heatmap.npy")
             np.save(heatmap_path, heatmap_distances)
             
@@ -1207,7 +1492,7 @@ def run_tx_predict(args: ap.ArgumentParser):
                 "description": "Euclidean distance heatmap: rows=positions (0-1999), cols=perturbations",
                 "perturbations": perts_order,
                 "distance_type": "mean_euclidean_norm_across_64_cells",
-                "upregulation": "2_std_deviation_shift"
+                "upregulation": "equivalent_euclidean_norm_perturbation_rescaled_from_2std_per_position"
             }
             heatmap_meta_path = os.path.join(results_dir, "position_upregulation_heatmap.meta.json")
             with open(heatmap_meta_path, "w") as f:
