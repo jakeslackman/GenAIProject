@@ -621,7 +621,7 @@ def run_tx_predict(args: ap.ArgumentParser):
         pathway_to_genes = defaultdict(list)
         
         for idx, data in gene_annotations.items():
-            mf_paths = data['go_cc_paths']
+            mf_paths = data['go_mf_paths']
             if mf_paths:  # If gene has MF pathways
                 pathways = mf_paths.split(';')
                 for pathway in pathways:
@@ -701,7 +701,7 @@ def run_tx_predict(args: ap.ArgumentParser):
         with torch.no_grad():
             for pathway_idx, (pathway_name, gene_indices) in enumerate(tqdm(filtered_pathways.items(), desc="Upregulating pathways", unit="pathway")):
                 # Apply downregulation to all genes in this pathway
-                apply_pathway_shift_to_core_cells(gene_indices, upregulate=True)
+                apply_pathway_shift_to_core_cells(gene_indices, upregulate=False)
                 
                 # Run inference for all perturbations with this pathway upregulated
                 for p_idx, pert in enumerate(perts_order):
@@ -753,11 +753,11 @@ def run_tx_predict(args: ap.ArgumentParser):
                 results_dir = os.path.join(args.output_dir, "eval_" + os.path.basename(args.checkpoint))
             os.makedirs(results_dir, exist_ok=True)
             
-            heatmap_path = os.path.join(results_dir, "go_cc_pathway_upregulation_heatmap.npy")
+            heatmap_path = os.path.join(results_dir, "go_mf_pathway_upregulation_heatmap.npy")
             np.save(heatmap_path, heatmap_distances)
             
             # Save pathway information
-            pathway_info_path = os.path.join(results_dir, "go_cc_pathways_info.json")
+            pathway_info_path = os.path.join(results_dir, "go_mf_pathways_info.json")
             pathway_info = {
                 "pathway_names": pathway_names,
                 "pathway_to_genes": {pathway: genes for pathway, genes in filtered_pathways.items()},
@@ -777,7 +777,7 @@ def run_tx_predict(args: ap.ArgumentParser):
                 "distance_type": "mean_euclidean_norm_across_64_cells",
                 "upregulation": "equivalent_euclidean_norm_perturbation_rescaled_from_2std_per_gene"
             }
-            heatmap_meta_path = os.path.join(results_dir, "go_cc_pathway_upregulation_heatmap.meta.json")
+            heatmap_meta_path = os.path.join(results_dir, "go_mf_pathway_upregulation_heatmap.meta.json")
             with open(heatmap_meta_path, "w") as f:
                 json.dump(heatmap_meta, f, indent=2)
             
@@ -792,7 +792,7 @@ def run_tx_predict(args: ap.ArgumentParser):
             if args.heatmap_output_path is not None:
                 heatmap_img_path = args.heatmap_output_path
             else:
-                heatmap_img_path = os.path.join(results_dir, "go_cc_pathway_upregulation_heatmap.png")
+                heatmap_img_path = os.path.join(results_dir, "go_mf_pathway_upregulation_heatmap.png")
             
             # Ensure directory exists
             os.makedirs(os.path.dirname(heatmap_img_path), exist_ok=True)
