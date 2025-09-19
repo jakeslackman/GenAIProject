@@ -90,7 +90,13 @@ def add_arguments_heatmap(parser: ap.ArgumentParser):
         default="/home/dhruvgautam/gene_annotations_1_2000.pkl",
         help="Path to the hvg gene annotations file.",
     )
-
+    parser.add_argument(
+        "--annotation-field",
+        type=str,
+        default="go_cc_paths",
+        help="Field name in the annotation data to use for pathway grouping (e.g., 'go_cc_paths', 'go_mf_paths', 'go_bp_paths', etc.).",
+    )
+    
 
 def run_tx_heatmap(args: ap.ArgumentParser):
     import logging
@@ -622,14 +628,14 @@ def run_tx_heatmap(args: ap.ArgumentParser):
         with open(args.annotation_path, 'rb') as f:
             gene_annotations = pickle.load(f)
         
-        # Group genes by GO MF pathways
+        # Group genes by pathways using the specified annotation field
         from collections import defaultdict
         pathway_to_genes = defaultdict(list)
         
         for idx, data in gene_annotations.items():
-            mf_paths = data['go_cc_paths']
-            if mf_paths:  # If gene has MF pathways
-                pathways = mf_paths.split(';')
+            pathway_data = data[args.annotation_field]
+            if pathway_data:  # If gene has pathways
+                pathways = pathway_data.split(';')
                 for pathway in pathways:
                     # Convert 1-indexed to 0-indexed
                     pathway_to_genes[pathway].append(idx - 1)
@@ -637,7 +643,7 @@ def run_tx_heatmap(args: ap.ArgumentParser):
         # Filter out pathways with too few genes (less than 3) to avoid noise
         filtered_pathways = {pathway: genes for pathway, genes in pathway_to_genes.items() if len(genes) >= 3}
         
-        logger.info(f"Found {len(pathway_to_genes)} total GO MF pathways")
+        logger.info(f"Found {len(pathway_to_genes)} total pathways from field '{args.annotation_field}'")
         logger.info(f"Using {len(filtered_pathways)} pathways with 3+ genes for upregulation")
         
         # Initialize heatmap array: [num_pathways, num_perturbations]
@@ -748,7 +754,10 @@ def run_tx_heatmap(args: ap.ArgumentParser):
                     else:
                         core_cells[k] = v.copy() if hasattr(v, 'copy') else v
         
-        logger.info("Phase 2 complete: Upregulated inference for all GO MF pathways.")
+        logger.info(f"Phase 2 complete: Upregulated inference for all pathways from field '{args.annotation_field}'.")
+        
+        # Create filename based on annotation field
+        field_suffix = args.annotation_field.replace('_', '').lower()
         
         # Save heatmap data
         try:
@@ -759,11 +768,11 @@ def run_tx_heatmap(args: ap.ArgumentParser):
                 results_dir = os.path.join(args.output_dir, "eval_" + os.path.basename(args.checkpoint))
             os.makedirs(results_dir, exist_ok=True)
             
-            heatmap_path = os.path.join(results_dir, "go_cc_pathway_upregulation_heatmap.npy")
+            heatmap_path = os.path.join(results_dir, f"{field_suffix}_pathway_upregulation_heatmap.npy")
             np.save(heatmap_path, heatmap_distances)
             
             # Save pathway information
-            pathway_info_path = os.path.join(results_dir, "go_cc_pathways_info.json")
+            pathway_info_path = os.path.join(results_dir, f"{field_suffix}_pathways_info.json")
             pathway_info = {
                 "pathway_names": pathway_names,
                 "pathway_to_genes": {pathway: genes for pathway, genes in filtered_pathways.items()},
@@ -777,17 +786,18 @@ def run_tx_heatmap(args: ap.ArgumentParser):
             # Save metadata for the heatmap
             heatmap_meta = {
                 "shape": [num_pathways, len(perts_order)],
-                "description": "Euclidean distance heatmap: rows=GO MF pathways, cols=perturbations",
+                "description": f"Euclidean distance heatmap: rows={args.annotation_field} pathways, cols=perturbations",
                 "perturbations": perts_order,
                 "pathway_names": pathway_names,
                 "distance_type": "mean_euclidean_norm_across_64_cells",
-                "upregulation": "equivalent_euclidean_norm_perturbation_rescaled_from_2std_per_gene"
+                "upregulation": "equivalent_euclidean_norm_perturbation_rescaled_from_2std_per_gene",
+                "annotation_field": args.annotation_field
             }
-            heatmap_meta_path = os.path.join(results_dir, "go_cc_pathway_upregulation_heatmap.meta.json")
+            heatmap_meta_path = os.path.join(results_dir, f"{field_suffix}_pathway_upregulation_heatmap.meta.json")
             with open(heatmap_meta_path, "w") as f:
                 json.dump(heatmap_meta, f, indent=2)
             
-            logger.info(f"Saved GO MF pathway upregulation heatmap to {heatmap_path}")
+            logger.info(f"Saved {args.annotation_field} pathway upregulation heatmap to {heatmap_path}")
             logger.info(f"Heatmap shape: {heatmap_distances.shape} (pathways x perturbations)")
         except Exception as e:
             logger.warning(f"Failed to save heatmap data: {e}")
@@ -798,7 +808,7 @@ def run_tx_heatmap(args: ap.ArgumentParser):
             if args.heatmap_output_path is not None:
                 heatmap_img_path = args.heatmap_output_path
             else:
-                heatmap_img_path = os.path.join(results_dir, "go_cc_pathway_upregulation_heatmap.png")
+                heatmap_img_path = os.path.join(results_dir, f"{field_suffix}_pathway_upregulation_heatmap.png")
             
             # Ensure directory exists
             os.makedirs(os.path.dirname(heatmap_img_path), exist_ok=True)
@@ -813,8 +823,8 @@ def run_tx_heatmap(args: ap.ArgumentParser):
             
             # Set labels and title
             ax.set_xlabel('Perturbations')
-            ax.set_ylabel('GO MF Pathways')
-            ax.set_title('GO MF Pathway Upregulation Impact Heatmap\n(Euclidean Distance from Normal Predictions)')
+            ax.set_ylabel(f'{args.annotation_field.replace("_", " ").title()} Pathways')
+            ax.set_title(f'{args.annotation_field.replace("_", " ").title()} Pathway Upregulation Impact Heatmap\n(Euclidean Distance from Normal Predictions)')
             
             # Set x-axis labels (perturbations)
             ax.set_xticks(range(len(perts_order)))
@@ -824,8 +834,11 @@ def run_tx_heatmap(args: ap.ArgumentParser):
             ax.set_yticks(range(num_pathways))
             truncated_pathway_names = []
             for pathway_name in pathway_names:
-                # Remove GOMF_ prefix and truncate long names
-                clean_name = pathway_name.replace('GOMF_', '')
+                # Remove common prefixes and truncate long names
+                clean_name = pathway_name
+                # Remove common GO prefixes
+                for prefix in ['GOMF_', 'GOCC_', 'GOBP_']:
+                    clean_name = clean_name.replace(prefix, '')
                 if len(clean_name) > 30:
                     clean_name = clean_name[:27] + '...'
                 truncated_pathway_names.append(clean_name)
@@ -842,7 +855,7 @@ def run_tx_heatmap(args: ap.ArgumentParser):
             plt.savefig(heatmap_img_path, dpi=300, bbox_inches='tight')
             plt.close(fig)  # Close to free memory
             
-            logger.info(f"Saved GO MF pathway heatmap visualization to {heatmap_img_path}")
+            logger.info(f"Saved {args.annotation_field} pathway heatmap visualization to {heatmap_img_path}")
             
         except Exception as e:
             logger.warning(f"Failed to create heatmap visualization: {e}")
