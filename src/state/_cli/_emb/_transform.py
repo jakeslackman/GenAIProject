@@ -3,8 +3,16 @@ import argparse as ap
 
 def add_arguments_transform(parser: ap.ArgumentParser):
     """Add arguments for state embedding CLI."""
-    parser.add_argument("--model-folder", required=True, help="Path to the model checkpoint folder")
-    parser.add_argument("--checkpoint", required=False, help="Path to the specific model checkpoint")
+    parser.add_argument(
+        "--model-folder",
+        required=False,
+        help="Path to the model checkpoint folder (required if --checkpoint is not provided)",
+    )
+    parser.add_argument(
+        "--checkpoint",
+        required=False,
+        help="Path to the specific model checkpoint (required if --model-folder is not provided)",
+    )
     parser.add_argument(
         "--config",
         required=False,
@@ -60,13 +68,19 @@ def run_emb_transform(args: ap.ArgumentParser):
         logger.error("Either --output or --lancedb must be provided")
         raise ValueError("Either --output or --lancedb must be provided")
 
-    # look in the model folder with glob for *.ckpt, get the first one, and print it
-    model_files = glob.glob(os.path.join(args.model_folder, "*.ckpt"))
-    if not model_files:
-        logger.error(f"No model checkpoint found in {args.model_folder}")
-        raise FileNotFoundError(f"No model checkpoint found in {args.model_folder}")
-    if not args.checkpoint:
-        args.checkpoint = model_files[-1]
+    # Resolve checkpoint path, allowing either --checkpoint, --model-folder, or both
+    checkpoint_path = args.checkpoint
+    if args.model_folder:
+        model_files = glob.glob(os.path.join(args.model_folder, "*.ckpt"))
+        if not model_files and not checkpoint_path:
+            logger.error(f"No model checkpoint found in {args.model_folder}")
+            raise FileNotFoundError(f"No model checkpoint found in {args.model_folder}")
+        if not checkpoint_path and model_files:
+            checkpoint_path = model_files[-1]
+    if not checkpoint_path:
+        logger.error("Either --checkpoint or --model-folder must be provided")
+        raise ValueError("Either --checkpoint or --model-folder must be provided")
+    args.checkpoint = checkpoint_path
     logger.info(f"Using model checkpoint: {args.checkpoint}")
 
     # Create inference object
@@ -79,7 +93,7 @@ def run_emb_transform(args: ap.ArgumentParser):
     if args.protein_embeddings:
         logger.info(f"Using protein embeddings override: {args.protein_embeddings}")
         protein_embeds = torch.load(args.protein_embeddings, weights_only=False, map_location="cpu")
-    else:
+    elif args.model_folder:
         # Try auto-detect in model folder
         try:
             exact_path = os.path.join(args.model_folder, "protein_embeddings.pt")
