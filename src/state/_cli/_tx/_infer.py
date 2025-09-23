@@ -27,7 +27,7 @@ def add_arguments_infer(parser: argparse.ArgumentParser):
         "--output",
         type=str,
         default=None,
-        help="Path to output AnnData file (.h5ad). Defaults to <input>_simulated.h5ad",
+        help="Path to output file (.h5ad or .npy). Defaults to <input>_simulated.h5ad",
     )
     parser.add_argument(
         "--model-dir",
@@ -650,15 +650,35 @@ def run_tx_infer(args: argparse.Namespace):
     # -----------------------
     # 5) Persist the updated AnnData
     # -----------------------
+    output_path = args.output or args.adata.replace(".h5ad", "_simulated.h5ad")
+    output_is_npy = output_path.lower().endswith(".npy")
+
+    pred_matrix = None
     if writes_to[0] == ".X":
         if out_target == "X":
             adata.X = sim_X
+            pred_matrix = sim_X
+        elif out_target.startswith("obsm['") and out_target.endswith("']"):
+            pred_key = out_target[6:-2]
+            pred_matrix = adata.obsm.get(pred_key)
+        else:
+            pred_matrix = sim_X
     else:
         if out_target == f"obsm['{writes_to[1]}']":
             adata.obsm[writes_to[1]] = sim_obsm
+            pred_matrix = sim_obsm
+        elif out_target.startswith("obsm['") and out_target.endswith("']"):
+            pred_key = out_target[6:-2]
+            pred_matrix = adata.obsm.get(pred_key)
+        else:
+            pred_matrix = sim_obsm
 
-    output_path = args.output or args.adata.replace(".h5ad", "_simulated.h5ad")
-    adata.write_h5ad(output_path)
+    if output_is_npy:
+        if pred_matrix is None:
+            raise ValueError("Predictions matrix is unavailable; cannot write .npy output")
+        np.save(output_path, np.asarray(pred_matrix))
+    else:
+        adata.write_h5ad(output_path)
 
     # -----------------------
     # 6) Summary
@@ -667,5 +687,10 @@ def run_tx_infer(args: argparse.Namespace):
     print(f"Input cells:         {n_total}")
     print(f"Controls simulated:  {n_controls}")
     print(f"Treated simulated:   {n_nonctl}")
-    print(f"Wrote predictions to adata.{out_target}")
-    print(f"Saved:               {output_path}")
+    if output_is_npy:
+        shape_str = " x ".join(str(dim) for dim in pred_matrix.shape) if pred_matrix is not None else "unknown"
+        print(f"Wrote predictions array (shape: {shape_str})")
+        print(f"Saved NumPy file:    {output_path}")
+    else:
+        print(f"Wrote predictions to adata.{out_target}")
+        print(f"Saved:               {output_path}")

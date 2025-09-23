@@ -277,6 +277,8 @@ class Inference:
 
             log.info(f"Successfully saved {len(all_embeddings)} embeddings to LanceDB")
 
+        return all_embeddings
+
     def _convert_to_csr(self, adata):
         """Convert the adata.X matrix to CSR format if it's not already."""
         from scipy.sparse import csr_matrix, issparse

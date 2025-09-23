@@ -54,6 +54,7 @@ def run_emb_transform(args: ap.ArgumentParser):
     import glob
     import logging
     import os
+    import numpy as np
 
     import torch
     from omegaconf import OmegaConf
@@ -124,6 +125,12 @@ def run_emb_transform(args: ap.ArgumentParser):
     logger.info(f"Loading model from checkpoint: {args.checkpoint}")
     inferer.load_model(args.checkpoint)
 
+    save_as_npy = False
+    output_target = args.output
+    if args.output:
+        _, ext = os.path.splitext(args.output)
+        save_as_npy = ext.lower() == ".npy"
+
     # Create output directory if it doesn't exist
     if args.output:
         output_dir = os.path.dirname(args.output)
@@ -134,18 +141,28 @@ def run_emb_transform(args: ap.ArgumentParser):
     # Generate embeddings
     logger.info(f"Computing embeddings for {args.input}")
     if args.output:
-        logger.info(f"Output will be saved to {args.output}")
+        if save_as_npy:
+            logger.info(f"Output embeddings will be saved to {args.output} as a NumPy array")
+        else:
+            logger.info(f"Output will be saved to {args.output}")
     if args.lancedb:
         logger.info(f"Embeddings will be saved to LanceDB at {args.lancedb}")
 
-    inferer.encode_adata(
+    embeddings = inferer.encode_adata(
         input_adata_path=args.input,
-        output_adata_path=args.output,
+        output_adata_path=None if save_as_npy else output_target,
         emb_key=args.embed_key,
         batch_size=args.batch_size if getattr(args, "batch_size", None) is not None else None,
         lancedb_path=args.lancedb,
         update_lancedb=args.lancedb_update,
         lancedb_batch_size=args.lancedb_batch_size,
     )
+
+    if save_as_npy:
+        if embeddings is None:
+            logger.error("Failed to generate embeddings for NumPy output")
+            raise RuntimeError("Embedding generation returned no data")
+        np.save(args.output, embeddings)
+        logger.info(f"Saved embeddings matrix with shape {embeddings.shape} to {args.output}")
 
     logger.info("Embedding computation completed successfully!")
