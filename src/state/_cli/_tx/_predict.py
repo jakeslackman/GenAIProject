@@ -52,8 +52,36 @@ def add_arguments_predict(parser: ap.ArgumentParser):
         help="If set, evaluate the model on the training data rather than on the test data.",
     )
 
+    # Eval-only flags: evaluate existing AnnData without running prediction
+    parser.add_argument(
+        "--eval-only",
+        action="store_true",
+        help=(
+            "If set, skip prediction and only compute metrics using provided AnnData paths "
+            "(or defaults under output-dir/eval_<checkpoint>/)."
+        ),
+    )
+    parser.add_argument(
+        "--eval-adata-pred",
+        type=str,
+        default="",
+        help=(
+            "Path to adata_pred.h5ad to evaluate. If not provided, uses "
+            "<output-dir>/eval_<checkpoint>/adata_pred.h5ad"
+        ),
+    )
+    parser.add_argument(
+        "--eval-adata-real",
+        type=str,
+        default="",
+        help=(
+            "Path to adata_real.h5ad to evaluate. If not provided, uses "
+            "<output-dir>/eval_<checkpoint>/adata_real.h5ad"
+        ),
+    )
 
-def run_tx_predict(args: ap.ArgumentParser):
+
+def run_tx_predict(args: ap.Namespace):
     import logging
     import os
     import sys
@@ -119,6 +147,56 @@ def run_tx_predict(args: ap.ArgumentParser):
             cfg = yaml.safe_load(f)
         return cfg
 
+    def run_evaluation(adata_pred, adata_real, results_dir: str):
+        """Run metrics evaluation given prediction and real AnnData objects."""
+        logger.info("Computing metrics using cell-eval...")
+        control_pert = data_module.get_control_pert()
+
+        ct_split_real = split_anndata_on_celltype(adata=adata_real, celltype_col=data_module.cell_type_key)
+        ct_split_pred = split_anndata_on_celltype(adata=adata_pred, celltype_col=data_module.cell_type_key)
+
+        assert len(ct_split_real) == len(ct_split_pred), (
+            f"Number of celltypes in real and pred anndata must match: {len(ct_split_real)} != {len(ct_split_pred)}"
+        )
+
+        pdex_kwargs = dict(exp_post_agg=True, is_log1p=True)
+        for ct in ct_split_real.keys():
+            real_ct = ct_split_real[ct]
+            pred_ct = ct_split_pred[ct]
+
+            evaluator = MetricsEvaluator(
+                adata_pred=pred_ct,
+                adata_real=real_ct,
+                control_pert=control_pert,
+                pert_col=data_module.pert_col,
+                outdir=results_dir,
+                prefix=ct,
+                pdex_kwargs=pdex_kwargs,
+                batch_size=2048,
+            )
+
+            evaluator.compute(
+                profile=args.profile,
+                metric_configs={
+                    "discrimination_score": {
+                        "embed_key": data_module.embed_key,
+                    }
+                    if data_module.embed_key and data_module.embed_key != "X_hvg"
+                    else {},
+                    "pearson_edistance": {
+                        "embed_key": data_module.embed_key,
+                        "n_jobs": -1,  # set to all available cores
+                    }
+                    if data_module.embed_key and data_module.embed_key != "X_hvg"
+                    else {
+                        "n_jobs": -1,
+                    },
+                }
+                if data_module.embed_key and data_module.embed_key != "X_hvg"
+                else {},
+                skip_metrics=["pearson_edistance", "clustering_agreement"],
+            )
+
     # 1. Load the config
     config_path = os.path.join(args.output_dir, "config.yaml")
     cfg = load_config(config_path)
@@ -135,6 +213,55 @@ def run_tx_predict(args: ap.ArgumentParser):
 
     # Seed everything
     pl.seed_everything(cfg["training"]["train_seed"])
+
+    # Eval results directory and default AnnData paths
+    results_dir = os.path.join(args.output_dir, "eval_" + os.path.basename(args.checkpoint))
+    os.makedirs(results_dir, exist_ok=True)
+    adata_pred_path_default = os.path.join(results_dir, "adata_pred.h5ad")
+    adata_real_path_default = os.path.join(results_dir, "adata_real.h5ad")
+
+    # If eval-only, load provided (or default) AnnData and run evaluation
+    if args.eval_only:
+        adata_pred_path = args.eval_adata_pred or adata_pred_path_default
+        adata_real_path = args.eval_adata_real or adata_real_path_default
+
+        if not os.path.exists(adata_pred_path) or not os.path.exists(adata_real_path):
+            raise FileNotFoundError(
+                "AnnData files not found for eval-only. "
+                f"pred: {adata_pred_path}, real: {adata_real_path}. "
+                "Provide paths via --eval-adata-pred/--eval-adata-real or generate them by running prediction first."
+            )
+
+        adata_pred = anndata.read_h5ad(adata_pred_path)
+        adata_real = anndata.read_h5ad(adata_real_path)
+
+        if args.shared_only:
+            try:
+                shared_perts = data_module.get_shared_perturbations()
+                if len(shared_perts) == 0:
+                    logger.warning("No shared perturbations between train and test; skipping filtering.")
+                else:
+                    logger.info(
+                        "Filtering to %d shared perturbations present in train ∩ test.",
+                        len(shared_perts),
+                    )
+                    mask = adata_pred.obs[data_module.pert_col].isin(shared_perts)
+                    before_n = adata_pred.n_obs
+                    adata_pred = adata_pred[mask].copy()
+                    adata_real = adata_real[mask].copy()
+                    logger.info(
+                        "Filtered cells: %d -> %d (kept only seen perturbations)",
+                        before_n,
+                        adata_pred.n_obs,
+                    )
+            except Exception as e:
+                logger.warning(
+                    "Failed to filter by shared perturbations (%s). Proceeding without filter.",
+                    str(e),
+                )
+
+        run_evaluation(adata_pred=adata_pred, adata_real=adata_real, results_dir=results_dir)
+        return
 
     # 3. Load the trained model
     checkpoint_dir = os.path.join(run_output_dir, "checkpoints")
@@ -328,7 +455,10 @@ def run_tx_predict(args: ap.ArgumentParser):
     var = pd.DataFrame({"gene_names": gene_names})
 
     if final_X_hvg is not None:
-        if len(gene_names) != final_pert_cell_counts_preds.shape[1]:
+        if (
+            final_pert_cell_counts_preds is not None
+            and len(gene_names) != final_pert_cell_counts_preds.shape[1]
+        ):
             gene_names = np.load(
                 "/large_storage/ctc/userspace/aadduri/datasets/tahoe_19k_to_2k_names.npy", allow_pickle=True
             )
@@ -384,8 +514,6 @@ def run_tx_predict(args: ap.ArgumentParser):
             )
 
     # Save the AnnData objects
-    results_dir = os.path.join(args.output_dir, "eval_" + os.path.basename(args.checkpoint))
-    os.makedirs(results_dir, exist_ok=True)
     adata_pred_path = os.path.join(results_dir, "adata_pred.h5ad")
     adata_real_path = os.path.join(results_dir, "adata_real.h5ad")
 
@@ -397,51 +525,4 @@ def run_tx_predict(args: ap.ArgumentParser):
 
     if not args.predict_only:
         # 6. Compute metrics using cell-eval
-        logger.info("Computing metrics using cell-eval...")
-
-        control_pert = data_module.get_control_pert()
-
-        ct_split_real = split_anndata_on_celltype(adata=adata_real, celltype_col=data_module.cell_type_key)
-        ct_split_pred = split_anndata_on_celltype(adata=adata_pred, celltype_col=data_module.cell_type_key)
-
-        assert len(ct_split_real) == len(ct_split_pred), (
-            f"Number of celltypes in real and pred anndata must match: {len(ct_split_real)} != {len(ct_split_pred)}"
-        )
-
-        pdex_kwargs = dict(exp_post_agg=True, is_log1p=True)
-        for ct in ct_split_real.keys():
-            real_ct = ct_split_real[ct]
-            pred_ct = ct_split_pred[ct]
-
-            evaluator = MetricsEvaluator(
-                adata_pred=pred_ct,
-                adata_real=real_ct,
-                control_pert=control_pert,
-                pert_col=data_module.pert_col,
-                outdir=results_dir,
-                prefix=ct,
-                pdex_kwargs=pdex_kwargs,
-                batch_size=2048,
-            )
-
-            evaluator.compute(
-                profile=args.profile,
-                metric_configs={
-                    "discrimination_score": {
-                        "embed_key": data_module.embed_key,
-                    }
-                    if data_module.embed_key and data_module.embed_key != "X_hvg"
-                    else {},
-                    "pearson_edistance": {
-                        "embed_key": data_module.embed_key,
-                        "n_jobs": -1,  # set to all available cores
-                    }
-                    if data_module.embed_key and data_module.embed_key != "X_hvg"
-                    else {
-                        "n_jobs": -1,
-                    },
-                }
-                if data_module.embed_key and data_module.embed_key != "X_hvg"
-                else {},
-                skip_metrics=["pearson_edistance", "clustering_agreement"],
-            )
+        run_evaluation(adata_pred=adata_pred, adata_real=adata_real, results_dir=results_dir)
