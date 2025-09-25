@@ -87,14 +87,17 @@ def add_arguments_heatmap(parser: ap.ArgumentParser):
     parser.add_argument(
         "--annotation-path",
         type=str,
-        default="/home/dhruvgautam/gene_annotations_1_2000.pkl",
+        default="/home/dhruvgautam/annotations/replogle_go_annotations.pkl", #/home/dhruvgautam/annotations/var_dims_gene_go_annotations.json
         help="Path to the hvg gene annotations file.",
     )
     parser.add_argument(
         "--annotation-field",
         type=str,
         default="go_cc_paths",
-        help="Field name in the annotation data to use for pathway grouping (e.g., 'go_cc_paths', 'go_mf_paths', 'go_bp_paths', etc.).",
+        help=(
+            "Field name in structured annotation data to use for pathway grouping (e.g., 'go_cc_paths'). "
+            "Ignored when loading JSON files that map genes directly to pathways."
+        ),
     )
     
 
@@ -175,6 +178,23 @@ def run_tx_heatmap(args: ap.ArgumentParser):
 
     # 2. Find run output directory & load data module
     run_output_dir = os.path.join(cfg["output_dir"], cfg["name"])
+    if not os.path.isabs(run_output_dir):
+        run_output_dir = os.path.abspath(run_output_dir)
+
+    if not os.path.exists(run_output_dir):
+        inferred_run_dir = args.output_dir
+        if os.path.exists(inferred_run_dir):
+            logger.warning(
+                "Run directory %s not found; falling back to config directory %s",
+                run_output_dir,
+                inferred_run_dir,
+            )
+            run_output_dir = inferred_run_dir
+        else:
+            raise FileNotFoundError(
+                "Could not resolve run directory. Checked: %s and %s" % (run_output_dir, inferred_run_dir)
+            )
+
     data_module_path = os.path.join(run_output_dir, "data_module.torch")
     if not os.path.exists(data_module_path):
         raise FileNotFoundError(f"Could not find data module at {data_module_path}?")
@@ -622,34 +642,163 @@ def run_tx_heatmap(args: ap.ArgumentParser):
     # Phase 2: Run inference with GO MF pathway groups upregulated (only if requested)
     if args.test_time_heat_map:
         logger.info("Phase 2: Loading GO MF pathway annotations and running pathway-based upregulation...")
-        
+
+        if args.results_dir is not None:
+            results_dir = args.results_dir
+        else:
+            results_dir = os.path.join(args.output_dir, "eval_" + os.path.basename(args.checkpoint))
+        os.makedirs(results_dir, exist_ok=True)
+        annotation_ext = os.path.splitext(args.annotation_path)[1].lower()
+        annotation_source_type = "unknown"
+        annotation_label = args.annotation_field
+        field_suffix = (
+            (annotation_label or "pathways").replace('_', '').lower()
+            if (annotation_label or "").strip()
+            else "pathways"
+        )
+
         # Load gene annotations
         import pickle
-        with open(args.annotation_path, 'rb') as f:
-            gene_annotations = pickle.load(f)
-        
-        # Group genes by pathways using the specified annotation field
         from collections import defaultdict
+
         pathway_to_genes = defaultdict(list)
-        
-        for idx, data in gene_annotations.items():
-            pathway_data = data[args.annotation_field]
-            if pathway_data:  # If gene has pathways
-                pathways = pathway_data.split(';')
+        gene_names = var_dims.get("gene_names")
+        gene_name_to_index = {str(name): idx for idx, name in enumerate(gene_names)} if gene_names is not None else {}
+
+        if annotation_ext == ".json":
+            annotation_source_type = "json"
+            annotation_label = os.path.splitext(os.path.basename(args.annotation_path))[0]
+            field_suffix = annotation_label.replace('_', '').lower() or "pathways"
+
+            with open(args.annotation_path, 'r') as f:
+                gene_annotations = json.load(f)
+
+            if not isinstance(gene_annotations, dict):
+                raise ValueError(
+                    f"Expected JSON annotation file {args.annotation_path} to map gene names to pathway collections."
+                )
+
+            missing_genes = set()
+            for gene_name, pathway_data in gene_annotations.items():
+                if not pathway_data:
+                    continue
+
+                idx = gene_name_to_index.get(str(gene_name))
+                if idx is None:
+                    missing_genes.add(str(gene_name))
+                    continue
+
+                if isinstance(pathway_data, str):
+                    pathways = [p.strip() for p in pathway_data.split(';') if p.strip()]
+                else:
+                    pathways = []
+                    for entry in pathway_data:
+                        if entry is None:
+                            continue
+                        pathways.append(str(entry).strip())
+                    pathways = [p for p in pathways if p]
+
                 for pathway in pathways:
-                    # Convert 1-indexed to 0-indexed
-                    pathway_to_genes[pathway].append(idx - 1)
+                    pathway_to_genes[pathway].append(idx)
+
+            if missing_genes:
+                sample_missing = ", ".join(sorted(missing_genes)[:5])
+                logger.warning(
+                    "Skipped %d gene(s) from annotation file not present in model gene names (e.g., %s)",
+                    len(missing_genes),
+                    sample_missing,
+                )
+        elif annotation_ext in {".pkl", ".pickle"}:
+            annotation_source_type = "pickle"
+            field_suffix = (
+                (args.annotation_field or "pathways").replace('_', '').lower()
+                if (args.annotation_field or "").strip()
+                else "pathways"
+            )
+
+            with open(args.annotation_path, 'rb') as f:
+                gene_annotations = pickle.load(f)
+
+            if not args.annotation_field:
+                raise ValueError(
+                    "--annotation-field must be provided when loading pickle annotation files."
+                )
+
+            for idx, data in gene_annotations.items():
+                pathway_data = None
+                if isinstance(data, dict):
+                    pathway_data = data.get(args.annotation_field)
+                else:
+                    try:
+                        pathway_data = data[args.annotation_field]
+                    except (KeyError, TypeError):
+                        pathway_data = getattr(data, args.annotation_field, None)
+
+                if not pathway_data:
+                    continue
+
+                if isinstance(pathway_data, str):
+                    pathways = [p.strip() for p in pathway_data.split(';') if p.strip()]
+                else:
+                    pathways = [str(p).strip() for p in pathway_data if str(p).strip()]
+
+                try:
+                    gene_index = int(idx) - 1
+                except (TypeError, ValueError):
+                    gene_index = gene_name_to_index.get(str(idx))
+
+                if gene_index is None or gene_index < 0:
+                    continue
+
+                for pathway in pathways:
+                    pathway_to_genes[pathway].append(gene_index)
+        else:
+            raise ValueError(
+                f"Unsupported annotation file extension '{annotation_ext}' for {args.annotation_path}."
+            )
         
         # Filter out pathways with too few genes (less than 3) to avoid noise
         filtered_pathways = {pathway: genes for pathway, genes in pathway_to_genes.items() if len(genes) >= 3}
         
-        logger.info(f"Found {len(pathway_to_genes)} total pathways from field '{args.annotation_field}'")
+        logger.info(
+            "Found %d total pathways from annotation source '%s' (%s)",
+            len(pathway_to_genes),
+            annotation_label,
+            annotation_source_type,
+        )
         logger.info(f"Using {len(filtered_pathways)} pathways with 3+ genes for upregulation")
         
         # Initialize heatmap array: [num_pathways, num_perturbations]
         num_pathways = len(filtered_pathways)
         heatmap_distances = np.zeros((num_pathways, len(perts_order)), dtype=np.float32)
         pathway_names = list(filtered_pathways.keys())
+
+        annotation_label_pretty = (annotation_label or "Annotation").replace('_', ' ').strip()
+        if annotation_label_pretty:
+            annotation_label_pretty = annotation_label_pretty.title()
+        else:
+            annotation_label_pretty = "Annotation"
+
+        upregulated_preds_path = None
+        upregulated_preds_memmap = None
+        if num_pathways == 0:
+            logger.warning("No pathways passed filtering; skipping upregulated prediction storage.")
+        else:
+            try:
+                upregulated_preds_path = os.path.join(
+                    results_dir,
+                    f"{field_suffix}_pathway_upregulated_preds.npy",
+                )
+                upregulated_preds_memmap = np.memmap(
+                    upregulated_preds_path,
+                    dtype=np.float32,
+                    mode="w+",
+                    shape=(num_pathways, len(perts_order), target_core_n, output_dim),
+                )
+            except Exception as e:
+                logger.warning("Failed to initialize storage for upregulated predictions: %s", e)
+                upregulated_preds_path = None
+                upregulated_preds_memmap = None
         
         # Create a copy of core_cells for upregulation experiments
         original_core_cells = {}
@@ -742,6 +891,9 @@ def run_tx_heatmap(args: ap.ArgumentParser):
                     batch_preds = model.predict_step(batch, p_idx, padded=False)
                     upregulated_preds = batch_preds["preds"].detach().cpu().numpy().astype(np.float32)
                     
+                    if upregulated_preds_memmap is not None:
+                        upregulated_preds_memmap[pathway_idx, p_idx, :, :] = upregulated_preds
+
                     # Compute euclidean distance between normal and upregulated predictions
                     normal_preds = normal_preds_per_pert[pert]  # [64, output_dim]
                     distance = np.linalg.norm(upregulated_preds - normal_preds, axis=1).mean()  # Mean across 64 cells
@@ -754,20 +906,18 @@ def run_tx_heatmap(args: ap.ArgumentParser):
                     else:
                         core_cells[k] = v.copy() if hasattr(v, 'copy') else v
         
-        logger.info(f"Phase 2 complete: Upregulated inference for all pathways from field '{args.annotation_field}'.")
+        logger.info(
+            "Phase 2 complete: Upregulated inference for all pathways from annotation source '%s'.",
+            annotation_label or annotation_source_type,
+        )
+
+        if upregulated_preds_memmap is not None:
+            upregulated_preds_memmap.flush()
+            logger.info(f"Saved upregulated prediction tensors to {upregulated_preds_path}")
         
         # Create filename based on annotation field
-        field_suffix = args.annotation_field.replace('_', '').lower()
-        
         # Save heatmap data
         try:
-            # Determine results directory
-            if args.results_dir is not None:
-                results_dir = args.results_dir
-            else:
-                results_dir = os.path.join(args.output_dir, "eval_" + os.path.basename(args.checkpoint))
-            os.makedirs(results_dir, exist_ok=True)
-            
             heatmap_path = os.path.join(results_dir, f"{field_suffix}_pathway_upregulation_heatmap.npy")
             np.save(heatmap_path, heatmap_distances)
             
@@ -786,18 +936,26 @@ def run_tx_heatmap(args: ap.ArgumentParser):
             # Save metadata for the heatmap
             heatmap_meta = {
                 "shape": [num_pathways, len(perts_order)],
-                "description": f"Euclidean distance heatmap: rows={args.annotation_field} pathways, cols=perturbations",
+                "description": (
+                    f"Euclidean distance heatmap: rows={annotation_label_pretty} pathways, cols=perturbations"
+                ),
                 "perturbations": perts_order,
                 "pathway_names": pathway_names,
                 "distance_type": "mean_euclidean_norm_across_64_cells",
                 "upregulation": "equivalent_euclidean_norm_perturbation_rescaled_from_2std_per_gene",
-                "annotation_field": args.annotation_field
+                "annotation_field": annotation_label if annotation_source_type != "json" else None,
+                "annotation_source_type": annotation_source_type,
+                "upregulated_preds_path": upregulated_preds_path,
             }
             heatmap_meta_path = os.path.join(results_dir, f"{field_suffix}_pathway_upregulation_heatmap.meta.json")
             with open(heatmap_meta_path, "w") as f:
                 json.dump(heatmap_meta, f, indent=2)
             
-            logger.info(f"Saved {args.annotation_field} pathway upregulation heatmap to {heatmap_path}")
+            logger.info(
+                "Saved %s pathway upregulation heatmap to %s",
+                annotation_label_pretty,
+                heatmap_path,
+            )
             logger.info(f"Heatmap shape: {heatmap_distances.shape} (pathways x perturbations)")
         except Exception as e:
             logger.warning(f"Failed to save heatmap data: {e}")
