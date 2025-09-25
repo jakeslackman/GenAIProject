@@ -250,7 +250,8 @@ def run_tx_train(cfg: DictConfig):
     # Decide on trainer params
     trainer_kwargs = dict(
         accelerator=accelerator,
-        devices=1,
+        devices=cfg["training"].get("devices", 1),
+        strategy=cfg["training"].get("strategy", "auto"),
         max_steps=cfg["training"]["max_steps"],  # for normal models
         check_val_every_n_epoch=None,
         val_check_interval=cfg["training"]["val_freq"],
@@ -258,22 +259,13 @@ def run_tx_train(cfg: DictConfig):
         plugins=plugins,
         callbacks=callbacks,
         gradient_clip_val=cfg["training"]["gradient_clip_val"] if cfg["model"]["name"].lower() != "cpa" else None,
+        use_distributed_sampler=False,  # Prevent Lightning from wrapping PerturbationBatchSampler with DistributedSampler
     )
 
     # Align logging cadence with rolling MFU window (and W&B logging)
     if "log_every_n_steps" in cfg["training"]:
         trainer_kwargs["log_every_n_steps"] = cfg["training"]["log_every_n_steps"]
 
-    # If it's SimpleSum, override to do exactly 1 epoch, ignoring `max_steps`.
-    if (
-        cfg["model"]["name"].lower() == "celltypemean"
-        or cfg["model"]["name"].lower() == "globalsimplesum"
-        or cfg["model"]["name"].lower() == "perturb_mean"
-        or cfg["model"]["name"].lower() == "context_mean"
-    ):
-        trainer_kwargs["max_epochs"] = 1  # do exactly one epoch
-        # delete max_steps to avoid conflicts
-        del trainer_kwargs["max_steps"]
 
     # Build trainer
     print(f"Building trainer with kwargs: {trainer_kwargs}")
