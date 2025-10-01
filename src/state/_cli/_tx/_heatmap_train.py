@@ -51,6 +51,14 @@ def add_arguments_heatmap(parser: ap.ArgumentParser):
         action="store_true",
         help="If set, evaluate the model on the training data rather than on the test data.",
     )
+    parser.add_argument(
+        "--eval-cell-type",
+        type=str,
+        default=None,
+        help=(
+            "If provided, restrict inference and metrics to the specified cell type; applies to train/test loaders."
+        ),
+    )
 
     # Optional: apply directional shift on a chosen index using control distributions
     parser.add_argument(
@@ -184,7 +192,114 @@ def run_tx_heatmap(args: ap.ArgumentParser, *, phase_one_only: bool = False):
 
     torch.multiprocessing.set_sharing_strategy("file_system")
 
-    def run_test_time_finetune(model, dataloader, ft_epochs, control_pert, device):
+    def _to_list(value):
+        if isinstance(value, list):
+            return value
+        if isinstance(value, torch.Tensor):
+            try:
+                return [x.item() if x.dim() == 0 else x for x in value]
+            except Exception:
+                return value.tolist()
+        if isinstance(value, (tuple, set)):
+            return list(value)
+        return [value]
+
+    def _resolve_celltype_key(batch):
+        candidate_keys = []
+        base_key = getattr(data_module, "cell_type_key", None)
+        if base_key:
+            candidate_keys.append(base_key)
+        alias_keys = getattr(data_module, "cell_type_key_aliases", None)
+        if isinstance(alias_keys, (list, tuple)):
+            candidate_keys.extend(alias_keys)
+        alias_keys_alt = getattr(data_module, "celltype_key_aliases", None)
+        if isinstance(alias_keys_alt, (list, tuple)):
+            candidate_keys.extend(alias_keys_alt)
+        candidate_keys.extend(
+            [
+                "celltype_name",
+                "cell_type",
+                "celltype",
+                "cell_line",
+            ]
+        )
+        seen = set()
+        ordered_candidates = []
+        for key in candidate_keys:
+            if not key or key in seen:
+                continue
+            seen.add(key)
+            ordered_candidates.append(key)
+            if key in batch:
+                return key, ordered_candidates
+        return None, ordered_candidates
+
+    celltype_batches_seen = False
+
+    def _filter_batch_by_celltype(batch, *, target_celltype):
+        nonlocal celltype_batches_seen
+        if target_celltype is None:
+            return batch
+        celltype_key, attempted_keys = _resolve_celltype_key(batch)
+        if celltype_key is None:
+            available_keys = [k for k in batch.keys() if isinstance(k, str)]
+            available_preview = ", ".join(sorted(available_keys)[:10])
+            raise ValueError(
+                "--eval-cell-type requested cell type filtering but none of the expected keys (%s) were present in batch data. Available batch keys: %s%s"
+                % (
+                    ", ".join(attempted_keys) if attempted_keys else "none",
+                    available_preview,
+                    "..." if len(available_keys) > 10 else "",
+                )
+            )
+
+        target_norm = str(target_celltype).lower()
+        celltypes = _to_list(batch[celltype_key])
+        mask_values = []
+        for ct in celltypes:
+            try:
+                match = str(ct).lower() == target_norm
+            except Exception:
+                match = False
+            mask_values.append(match)
+
+        if not mask_values:
+            return None
+
+        mask = torch.tensor(mask_values, dtype=torch.bool)
+        if mask.sum().item() == 0:
+            return None
+
+        filtered = {}
+        for k, v in batch.items():
+            if isinstance(v, torch.Tensor):
+                try:
+                    mask_device = mask.to(v.device) if mask.device != v.device else mask
+                    filtered_val = v[mask_device]
+                    if filtered_val.shape[0] == 0:
+                        return None
+                    filtered[k] = filtered_val
+                except Exception:
+                    filtered[k] = v
+            else:
+                vals = _to_list(v)
+                mask_list = mask.tolist()
+                filtered[k] = [vals[i] for i, keep in enumerate(mask_list[: len(vals)]) if keep]
+        celltype_batches_seen = True
+        return filtered
+
+    def _iter_batches(dataloader, *, target_celltype=None):
+        if target_celltype is None:
+            for batch in dataloader:
+                yield batch
+            return
+        for batch in dataloader:
+            filtered = _filter_batch_by_celltype(batch, target_celltype=target_celltype)
+            if filtered is None:
+                continue
+            yield filtered
+
+    def run_test_time_finetune(model, dataloader, ft_epochs, control_pert, device, *, filter_batch_fn=None):
         """
         Perform test-time fine-tuning on only control cells.
         """
@@ -196,6 +311,10 @@ def run_tx_heatmap(args: ap.ArgumentParser, *, phase_one_only: bool = False):
             epoch_losses = []
             pbar = tqdm(dataloader, desc=f"Finetune epoch {epoch + 1}/{ft_epochs}", leave=True)
             for batch in pbar:
+                if filter_batch_fn is not None:
+                    batch = filter_batch_fn(batch)
+                    if batch is None:
+                        continue
                 # Check if this batch contains control cells
                 first_pert = (
                     batch["pert_name"][0] if isinstance(batch["pert_name"], list) else batch["pert_name"][0].item()
@@ -320,48 +439,47 @@ def run_tx_heatmap(args: ap.ArgumentParser, *, phase_one_only: bool = False):
 
     # 4. Test-time fine-tuning if requested
     data_module.batch_size = 1
+    filter_celltype = getattr(args, "eval_cell_type", None)
+
     if args.test_time_finetune > 0:
         control_pert = data_module.get_control_pert()
-        if args.eval_train_data:
-            test_loader = data_module.train_dataloader(test=True)
-        else:
-            test_loader = data_module.test_dataloader()
-
         run_test_time_finetune(
-            model, test_loader, args.test_time_finetune, control_pert, device=next(model.parameters()).device
+            model,
+            data_module.train_dataloader(test=True) if args.eval_train_data else data_module.test_dataloader(),
+            args.test_time_finetune,
+            control_pert,
+            device=next(model.parameters()).device,
+            filter_batch_fn=(
+                (lambda batch: _filter_batch_by_celltype(batch, target_celltype=filter_celltype))
+                if filter_celltype is not None
+                else None
+            ),
         )
         logger.info("Test-time fine-tuning complete.")
 
     # 5. Run inference on test set
     data_module.setup(stage="test")
-    if args.eval_train_data:
-        scan_loader = data_module.train_dataloader(test=True)
-    else:
-        scan_loader = data_module.test_dataloader()
+    base_scan_loader = data_module.train_dataloader(test=True) if args.eval_train_data else data_module.test_dataloader()
+
+    celltype_filter = getattr(args, "eval_cell_type", None)
+
+    def _scan_batches():
+        return _iter_batches(base_scan_loader, target_celltype=celltype_filter) if celltype_filter is not None else base_scan_loader
+
+    scan_loader = _scan_batches()
 
     if scan_loader is None:
         logger.warning("No test dataloader found. Exiting.")
         sys.exit(0)
 
-    logger.info("Preparing a fixed batch of 256 control cells (core_cells) and enumerating perturbations...")
-
-    # Helper to normalize values to python lists
-    def _to_list(value):
-        if isinstance(value, list):
-            return value
-        if isinstance(value, torch.Tensor):
-            try:
-                return [x.item() if x.dim() == 0 else x for x in value]
-            except Exception:
-                return value.tolist()
-        return [value]
+    logger.info("Preparing a fixed batch of 64 control cells (core_cells) and enumerating perturbations...")
 
     control_pert = data_module.get_control_pert()
 
     # Collect unique perturbation names from the loader without running the model
     unique_perts = []
     seen_perts = set()
-    for batch in scan_loader:
+    for batch in _scan_batches():
         names = _to_list(batch.get("pert_name", []))
         for n in names:
             if isinstance(n, torch.Tensor):
@@ -373,13 +491,18 @@ def run_tx_heatmap(args: ap.ArgumentParser, *, phase_one_only: bool = False):
                 seen_perts.add(n)
                 unique_perts.append(n)
 
+    if celltype_filter is not None and not celltype_batches_seen:
+        raise ValueError(
+            f"Requested eval cell type '{celltype_filter}' not found in data loader batches; cannot proceed."
+        )
+
     if control_pert in seen_perts:
         logger.info(f"Found {len(unique_perts)} total perturbations (including control '{control_pert}').")
     else:
         logger.warning("Control perturbation not observed in test loader perturbation names.")
 
-    # Build a single fixed batch of exactly 256 control cells
-    target_core_n = 256
+    # Build a single fixed batch of exactly 64 control cells
+    target_core_n = 64
     core_cells = None
     accum = {}
 
@@ -389,7 +512,7 @@ def run_tx_heatmap(args: ap.ArgumentParser, *, phase_one_only: bool = False):
         store[key].append(value)
 
     # Iterate again to collect control cells only
-    for batch in scan_loader:
+    for batch in _scan_batches():
         names = _to_list(batch.get("pert_name", []))
         # Build a mask for control entries when possible
         mask = None
@@ -401,7 +524,7 @@ def run_tx_heatmap(args: ap.ArgumentParser, *, phase_one_only: bool = False):
             # If no names provided in batch, skip (cannot verify control)
             continue
 
-        # Slice each tensor field by mask and accumulate until we have 256
+        # Slice each tensor field by mask and accumulate until we have 64
         current_count = 0 if "_count" not in accum else accum["_count"]
         take = min(target_core_n - current_count, int(mask.sum().item()))
         if take <= 0:
@@ -432,7 +555,7 @@ def run_tx_heatmap(args: ap.ArgumentParser, *, phase_one_only: bool = False):
     if accum.get("_count", 0) < target_core_n:
         raise RuntimeError(f"Could not assemble {target_core_n} control cells for core_cells; gathered {accum.get('_count', 0)}.")
 
-    # Collate accumulated pieces into a single batch dict of length 256
+    # Collate accumulated pieces into a single batch dict of length 64
     core_cells = {}
     for k, parts in accum.items():
         if k == "_count":
@@ -447,7 +570,7 @@ def run_tx_heatmap(args: ap.ArgumentParser, *, phase_one_only: bool = False):
                 for p in parts:
                     merged.extend(_to_list(p))
                 val = merged
-        # Ensure final length == 256
+        # Ensure final length == 64
         if isinstance(val, torch.Tensor):
             core_cells[k] = val[:target_core_n]
         else:
@@ -464,7 +587,7 @@ def run_tx_heatmap(args: ap.ArgumentParser, *, phase_one_only: bool = False):
     vector_key_candidates = ["ctrl_cell_emb", "pert_cell_emb", "X"]
     dist_source_key = None
     # Find key by peeking one batch
-    for b in scan_loader:
+    for b in _scan_batches():
         for cand in vector_key_candidates:
             if cand in b and isinstance(b[cand], torch.Tensor) and b[cand].dim() == 2:
                 dist_source_key = cand
@@ -482,7 +605,7 @@ def run_tx_heatmap(args: ap.ArgumentParser, *, phase_one_only: bool = False):
 
     # Aggregate all control rows for the chosen key
     control_rows = []
-    for batch in scan_loader:
+    for batch in _scan_batches():
         names = _to_list(batch.get("pert_name", []))
         if len(names) == 0:
             continue
@@ -571,8 +694,8 @@ def run_tx_heatmap(args: ap.ArgumentParser, *, phase_one_only: bool = False):
         final_reals = np.empty((num_cells, output_dim), dtype=np.float32)
 
         # Phase 2: Store normal predictions for distance computation
-        normal_preds_per_pert = {}  # pert_name -> [256, output_dim] array
-        real_preds_per_pert = {}  # pert_name -> [256, output_dim] array
+        normal_preds_per_pert = {}  # pert_name -> [64, output_dim] array
+        real_preds_per_pert = {}  # pert_name -> [64, output_dim] array
 
         store_raw_expression = (
             data_module.embed_key is not None
@@ -1012,8 +1135,8 @@ def run_tx_heatmap(args: ap.ArgumentParser, *, phase_one_only: bool = False):
                             upregulated_preds_memmap[pathway_idx, p_idx, :, :] = upregulated_preds
 
                         # Compute euclidean distance between normal and upregulated predictions
-                        normal_preds = normal_preds_per_pert[pert]  # [256, output_dim]
-                        distance = np.linalg.norm(upregulated_preds - normal_preds, axis=1).mean()  # Mean across 256 cells
+                        normal_preds = normal_preds_per_pert[pert]  # [64, output_dim]
+                        distance = np.linalg.norm(upregulated_preds - normal_preds, axis=1).mean()  # Mean across 64 cells
                         heatmap_distances[pathway_idx, p_idx] = distance
         
         logger.info(
@@ -1061,7 +1184,7 @@ def run_tx_heatmap(args: ap.ArgumentParser, *, phase_one_only: bool = False):
                 ),
                 "perturbations": perts_order,
                 "pathway_names": pathway_names,
-                "distance_type": "mean_euclidean_norm_across_256_cells",
+                "distance_type": "mean_euclidean_norm_across_64_cells",
                 "upregulation": "equivalent_euclidean_norm_perturbation_rescaled_from_2std_per_gene",
                 "annotation_field": annotation_label if annotation_source_type != "json" else None,
                 "annotation_source_type": annotation_source_type,

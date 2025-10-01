@@ -343,7 +343,7 @@ def run_tx_heatmap(args: ap.ArgumentParser, *, phase_one_only: bool = False):
         logger.warning("No test dataloader found. Exiting.")
         sys.exit(0)
 
-    logger.info("Preparing a fixed batch of 256 control cells (core_cells) and enumerating perturbations...")
+    logger.info("Preparing a fixed batch of 64 control cells (core_cells) and enumerating perturbations...")
 
     # Helper to normalize values to python lists
     def _to_list(value):
@@ -378,8 +378,8 @@ def run_tx_heatmap(args: ap.ArgumentParser, *, phase_one_only: bool = False):
     else:
         logger.warning("Control perturbation not observed in test loader perturbation names.")
 
-    # Build a single fixed batch of exactly 256 control cells
-    target_core_n = 256
+    # Build a single fixed batch of exactly 64 control cells
+    target_core_n = 64
     core_cells = None
     accum = {}
 
@@ -401,7 +401,7 @@ def run_tx_heatmap(args: ap.ArgumentParser, *, phase_one_only: bool = False):
             # If no names provided in batch, skip (cannot verify control)
             continue
 
-        # Slice each tensor field by mask and accumulate until we have 256
+        # Slice each tensor field by mask and accumulate until we have 64
         current_count = 0 if "_count" not in accum else accum["_count"]
         take = min(target_core_n - current_count, int(mask.sum().item()))
         if take <= 0:
@@ -432,7 +432,7 @@ def run_tx_heatmap(args: ap.ArgumentParser, *, phase_one_only: bool = False):
     if accum.get("_count", 0) < target_core_n:
         raise RuntimeError(f"Could not assemble {target_core_n} control cells for core_cells; gathered {accum.get('_count', 0)}.")
 
-    # Collate accumulated pieces into a single batch dict of length 256
+    # Collate accumulated pieces into a single batch dict of length 64
     core_cells = {}
     for k, parts in accum.items():
         if k == "_count":
@@ -447,7 +447,7 @@ def run_tx_heatmap(args: ap.ArgumentParser, *, phase_one_only: bool = False):
                 for p in parts:
                     merged.extend(_to_list(p))
                 val = merged
-        # Ensure final length == 256
+        # Ensure final length == 64
         if isinstance(val, torch.Tensor):
             core_cells[k] = val[:target_core_n]
         else:
@@ -571,8 +571,8 @@ def run_tx_heatmap(args: ap.ArgumentParser, *, phase_one_only: bool = False):
         final_reals = np.empty((num_cells, output_dim), dtype=np.float32)
 
         # Phase 2: Store normal predictions for distance computation
-        normal_preds_per_pert = {}  # pert_name -> [256, output_dim] array
-        real_preds_per_pert = {}  # pert_name -> [256, output_dim] array
+        normal_preds_per_pert = {}  # pert_name -> [64, output_dim] array
+        real_preds_per_pert = {}  # pert_name -> [64, output_dim] array
 
         store_raw_expression = (
             data_module.embed_key is not None
@@ -1012,8 +1012,8 @@ def run_tx_heatmap(args: ap.ArgumentParser, *, phase_one_only: bool = False):
                             upregulated_preds_memmap[pathway_idx, p_idx, :, :] = upregulated_preds
 
                         # Compute euclidean distance between normal and upregulated predictions
-                        normal_preds = normal_preds_per_pert[pert]  # [256, output_dim]
-                        distance = np.linalg.norm(upregulated_preds - normal_preds, axis=1).mean()  # Mean across 256 cells
+                        normal_preds = normal_preds_per_pert[pert]  # [64, output_dim]
+                        distance = np.linalg.norm(upregulated_preds - normal_preds, axis=1).mean()  # Mean across 64 cells
                         heatmap_distances[pathway_idx, p_idx] = distance
         
         logger.info(
@@ -1061,7 +1061,7 @@ def run_tx_heatmap(args: ap.ArgumentParser, *, phase_one_only: bool = False):
                 ),
                 "perturbations": perts_order,
                 "pathway_names": pathway_names,
-                "distance_type": "mean_euclidean_norm_across_256_cells",
+                "distance_type": "mean_euclidean_norm_across_64_cells",
                 "upregulation": "equivalent_euclidean_norm_perturbation_rescaled_from_2std_per_gene",
                 "annotation_field": annotation_label if annotation_source_type != "json" else None,
                 "annotation_source_type": annotation_source_type,
