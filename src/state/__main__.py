@@ -12,6 +12,7 @@ from ._cli import (
     run_emb_preprocess,
     run_emb_eval,
     run_tx_double,
+    run_tx_single,
     run_tx_heatmap,
     run_tx_infer,
     run_tx_predict,
@@ -129,6 +130,9 @@ def main():
                 case "double":
                     # Run double perturbation analysis using argparse
                     run_tx_double(args)
+                case "single":
+                    # Run single perturbation analysis using argparse
+                    run_tx_single(args)
                 case "infer":
                     # Run inference using argparse, similar to predict
                     run_tx_infer(args)

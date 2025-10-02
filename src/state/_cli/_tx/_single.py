@@ -1,8 +1,8 @@
 import argparse as ap
 
 
-def add_arguments_double(parser: ap.ArgumentParser) -> None:
-    """CLI for double perturbation analysis on a target cell line."""
+def add_arguments_single(parser: ap.ArgumentParser) -> None:
+    """CLI for single-pass perturbation analysis on a target cell line."""
 
     parser.add_argument(
         "--output-dir",
@@ -17,12 +17,6 @@ def add_arguments_double(parser: ap.ArgumentParser) -> None:
         type=str,
         default="last.ckpt",
         help="Checkpoint filename relative to the output directory (default: last.ckpt).",
-    )
-    parser.add_argument(
-        "--test-time-finetune",
-        type=int,
-        default=0,
-        help="If >0, run test-time fine-tuning for the specified number of epochs on control cells only.",
     )
     parser.add_argument(
         "--profile",
@@ -50,7 +44,7 @@ def add_arguments_double(parser: ap.ArgumentParser) -> None:
         "--target-cell-type",
         type=str,
         required=True,
-        help="Cell type to construct the base core cells for double perturbations.",
+        help="Cell type to construct the base core cells for single perturbations.",
     )
     parser.add_argument(
         "--results-dir",
@@ -74,11 +68,10 @@ def add_arguments_double(parser: ap.ArgumentParser) -> None:
     )
 
 
-def run_tx_double(args: ap.ArgumentParser, *, phase_one_only: bool = False) -> None:
+def run_tx_single(args: ap.ArgumentParser, *, phase_one_only: bool = False) -> None:
     import logging
     import os
     import sys
-    import copy
 
     import anndata
     import lightning.pytorch as pl
@@ -116,18 +109,6 @@ def run_tx_double(args: ap.ArgumentParser, *, phase_one_only: bool = False) -> N
                 logger.info("Saved snapshot to %s", path)
         except Exception as exc:
             logger.warning("Failed to save %s to %s: %s", description or "snapshot", path, exc)
-
-    def _clone_core_cells(src):
-        cloned = {}
-        for key, value in src.items():
-            if isinstance(value, torch.Tensor):
-                cloned[key] = value.clone()
-            else:
-                try:
-                    cloned[key] = copy.deepcopy(value)
-                except Exception:
-                    cloned[key] = value
-        return cloned
 
     def _to_list(value):
         if isinstance(value, list):
@@ -351,19 +332,6 @@ def run_tx_double(args: ap.ArgumentParser, *, phase_one_only: bool = False) -> N
         return _generator()
 
     eval_loader = _create_filtered_loader(data_module)
-
-    if args.test_time_finetune > 0:
-        control_pert = data_module.get_control_pert()
-        run_test_time_finetune(
-            model,
-            eval_loader,
-            args.test_time_finetune,
-            control_pert,
-            device=next(model.parameters()).device,
-            filter_batch_fn=None,
-        )
-        eval_loader = _create_filtered_loader(data_module)
-        logger.info("Test-time fine-tuning complete.")
 
     logger.info("Preparing core cells batch and enumerating perturbations...")
 
@@ -631,113 +599,6 @@ def run_tx_double(args: ap.ArgumentParser, *, phase_one_only: bool = False) -> N
 
     logger.info("First pass complete across %d perturbations.", num_perts)
 
-    if phase_one_only:
-        preds_path = os.path.join(results_dir_default, "first_pass_preds.npy")
-        np.save(preds_path, first_pass_preds, allow_pickle=True)
-        logger.info(
-            "Saved first-pass predictions for %d perturbations to %s",
-            num_perts,
-            preds_path,
-        )
-        return
-
-    logger.info("Preparing cached first-pass outputs as inputs for second-pass perturbation sweep...")
-
-    embedding_field_candidates = [
-        key
-        for key, value in core_cells.items()
-        if isinstance(value, torch.Tensor) and value.dim() == 2
-    ]
-    embedding_field_key = embedding_field_candidates[0] if embedding_field_candidates else None
-    if embedding_field_key is None:
-        raise RuntimeError("Unable to identify a 2D tensor field in core_cells for second-pass initialization.")
-
-    double_core_cells = []
-    for idx, first_pert in enumerate(perts_order):
-        snapshot = _clone_core_cells(core_cells)
-        preds_tensor = torch.tensor(first_pass_preds[idx], device=device, dtype=torch.float32)
-        real_tensor = torch.tensor(first_pass_real[idx], device=device, dtype=torch.float32)
-
-        snapshot[embedding_field_key] = preds_tensor.clone()
-        if embedding_field_key != "ctrl_cell_emb" and "ctrl_cell_emb" in snapshot:
-            snapshot["ctrl_cell_emb"] = preds_tensor.clone()
-        snapshot["pert_cell_emb"] = real_tensor.clone()
-
-        if store_counts and first_pass_counts is not None:
-            snapshot["pert_cell_counts"] = torch.tensor(
-                first_pass_counts[idx], device=device, dtype=torch.float32
-            )
-        if store_counts and first_pass_counts_pred is not None:
-            snapshot["pert_cell_counts_preds"] = torch.tensor(
-                first_pass_counts_pred[idx], device=device, dtype=torch.float32
-            )
-
-        double_core_cells.append((first_pert, snapshot))
-
-    second_pass_preds = np.empty((num_perts, num_perts, target_core_n, output_dim), dtype=np.float32)
-    second_pass_real = np.empty_like(second_pass_preds)
-    second_pass_counts = (
-        np.empty((num_perts, num_perts, target_core_n, first_pass_counts.shape[-1]), dtype=np.float32)
-        if store_counts and first_pass_counts is not None
-        else None
-    )
-    second_pass_counts_pred = (
-        np.empty((num_perts, num_perts, target_core_n, first_pass_counts_pred.shape[-1]), dtype=np.float32)
-        if store_counts and first_pass_counts_pred is not None
-        else None
-    )
-
-    with torch.no_grad():
-        for first_idx, (first_pert, pert_batch) in enumerate(
-            tqdm(double_core_cells, desc="Second pass", unit="core")
-        ):
-            for second_idx, second_pert in enumerate(perts_order):
-                batch = {}
-                for key, value in pert_batch.items():
-                    if isinstance(value, torch.Tensor):
-                        batch[key] = value.clone().to(device)
-                    else:
-                        batch[key] = list(value)
-
-                if "pert_name" in batch:
-                    batch["pert_name"] = [second_pert for _ in range(target_core_n)]
-                if "pert_idx" in batch and hasattr(data_module, "get_pert_index"):
-                    try:
-                        idx_val = int(data_module.get_pert_index(second_pert))
-                        batch["pert_idx"] = torch.tensor([idx_val] * target_core_n, device=device)
-                    except Exception:
-                        pass
-
-                batch["pert_emb"] = _prepare_pert_emb(second_pert, target_core_n)
-
-                batch_preds = model.predict_step(batch, second_idx, padded=False)
-
-                second_pass_preds[first_idx, second_idx, :, :] = (
-                    batch_preds["preds"].detach().cpu().numpy().astype(np.float32)
-                )
-                second_pass_real[first_idx, second_idx, :, :] = (
-                    batch_preds["pert_cell_emb"].detach().cpu().numpy().astype(np.float32)
-                )
-
-                if second_pass_counts is not None and batch_preds.get("pert_cell_counts") is not None:
-                    second_pass_counts[first_idx, second_idx, :, :] = (
-                        batch_preds["pert_cell_counts"].detach().cpu().numpy().astype(np.float32)
-                    )
-
-                if (
-                    second_pass_counts_pred is not None
-                    and batch_preds.get("pert_cell_counts_preds") is not None
-                ):
-                    second_pass_counts_pred[first_idx, second_idx, :, :] = (
-                        batch_preds["pert_cell_counts_preds"].detach().cpu().numpy().astype(np.float32)
-                    )
-
-    logger.info(
-        "Second pass complete: generated double-perturbation predictions across %d x %d combinations.",
-        num_perts,
-        num_perts,
-    )
-
     metadata_df = pd.DataFrame(metadata)
     if metadata_df.empty:
         raise RuntimeError("No metadata collected during first pass; cannot proceed.")
@@ -783,39 +644,6 @@ def run_tx_double(args: ap.ArgumentParser, *, phase_one_only: bool = False) -> N
     first_pass_pred_adata.obsm[embed_key] = first_pass_pred_flat
     first_pass_real_adata.obsm[embed_key] = first_pass_real_flat
 
-    second_pass_dir = os.path.join(results_dir_default, "second_pass")
-    os.makedirs(second_pass_dir, exist_ok=True)
-    np.save(os.path.join(second_pass_dir, "second_pass_preds.npy"), second_pass_preds)
-    np.save(os.path.join(second_pass_dir, "second_pass_real.npy"), second_pass_real)
-    if second_pass_counts is not None:
-        np.save(os.path.join(second_pass_dir, "second_pass_counts.npy"), second_pass_counts)
-    if second_pass_counts_pred is not None:
-        np.save(os.path.join(second_pass_dir, "second_pass_counts_pred.npy"), second_pass_counts_pred)
-
-    second_pass_obs = pd.DataFrame(
-        {
-            "first_pert": np.repeat(perts_order, num_perts * target_core_n),
-            "second_pert": np.tile(np.repeat(perts_order, target_core_n), num_perts),
-            "core_cell_index": np.tile(np.arange(target_core_n), num_perts * num_perts),
-        }
-    )
-    second_pass_obs.index = [f"second_pass_cell_{idx}" for idx in range(second_pass_obs.shape[0])]
-    second_pass_var = pd.DataFrame(
-        index=pd.Index([f"embedding_{idx}" for idx in range(output_dim)], name="embedding"),
-    )
-
-    second_pass_pred_flat = second_pass_preds.reshape(num_perts * num_perts * target_core_n, output_dim)
-    second_pass_real_flat = second_pass_real.reshape(num_perts * num_perts * target_core_n, output_dim)
-
-    second_pass_adata = anndata.AnnData(
-        X=second_pass_pred_flat,
-        obs=second_pass_obs,
-        var=second_pass_var,
-    )
-    second_pass_adata.obsm[embed_key] = second_pass_pred_flat
-    second_pass_adata.obsm[f"{embed_key}_baseline"] = second_pass_real_flat
-    second_pass_adata.write_h5ad(os.path.join(second_pass_dir, "second_pass_preds.h5ad"))
-
     first_pass_pred_path = os.path.join(results_dir_default, "first_pass_preds.h5ad")
     first_pass_real_path = os.path.join(results_dir_default, "first_pass_real.h5ad")
     first_pass_pred_adata.write_h5ad(first_pass_pred_path)
@@ -829,6 +657,10 @@ def run_tx_double(args: ap.ArgumentParser, *, phase_one_only: bool = False) -> N
         np.save(os.path.join(results_dir_default, "first_pass_counts.npy"), first_pass_counts)
     if first_pass_counts_pred is not None:
         np.save(os.path.join(results_dir_default, "first_pass_counts_pred.npy"), first_pass_counts_pred)
+
+    if phase_one_only:
+        logger.info("Phase one complete; skipping metrics as requested.")
+        return
 
     if args.predict_only:
         return
@@ -891,4 +723,4 @@ def run_tx_double(args: ap.ArgumentParser, *, phase_one_only: bool = False) -> N
 
 def save_core_cells_real_preds(args: ap.ArgumentParser) -> None:
     """Run only phase one of the pipeline and persist real core-cell embeddings per perturbation."""
-    return run_tx_double(args, phase_one_only=True)
+    return run_tx_single(args, phase_one_only=True)
