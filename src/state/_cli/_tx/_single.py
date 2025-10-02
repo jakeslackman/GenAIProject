@@ -38,13 +38,16 @@ def add_arguments_single(parser: ap.ArgumentParser) -> None:
     parser.add_argument(
         "--eval-train-data",
         action="store_true",
-        help="Evaluate the model on the training data instead of the test data.",
+        help="Evaluate the model on the training data instead of the test data (ignored with --core-cells-path).",
     )
     parser.add_argument(
         "--target-cell-type",
         type=str,
-        required=True,
-        help="Cell type to construct the base core cells for single perturbations.",
+        default=None,
+        help=(
+            "Optional cell type to construct the base core cells for single perturbations."
+            " Ignored when --core-cells-path is provided."
+        ),
     )
     parser.add_argument(
         "--results-dir",
@@ -64,6 +67,14 @@ def add_arguments_single(parser: ap.ArgumentParser) -> None:
         help=(
             "Path to a NumPy .npy file containing a serialized core_cells dictionary to use instead of"
             " constructing a new control batch."
+        ),
+    )
+    parser.add_argument(
+        "--data-config",
+        type=str,
+        default=None,
+        help=(
+            "Path to a TOML data configuration file to override the data paths in the loaded data module."
         ),
     )
 
@@ -188,12 +199,48 @@ def run_tx_single(args: ap.ArgumentParser, *, phase_one_only: bool = False) -> N
                 "Could not resolve run directory. Checked: %s and %s" % (run_output_dir, inferred_run_dir)
             )
 
-    data_module_path = os.path.join(run_output_dir, "data_module.torch")
-    if not os.path.exists(data_module_path):
-        raise FileNotFoundError(f"Could not find data module at {data_module_path}")
-    data_module = PerturbationDataModule.load_state(data_module_path)
-    data_module.setup(stage="test")
-    logger.info("Loaded data module from %s", data_module_path)
+    # Override data paths if --data-config is provided
+    # We need to modify the saved state before loading the data module
+    if getattr(args, "data_config", None) is not None:
+        import tempfile
+        
+        logger.info("Overriding data paths with config from %s", args.data_config)
+        
+        data_module_path = os.path.join(run_output_dir, "data_module.torch")
+        if not os.path.exists(data_module_path):
+            raise FileNotFoundError(f"Could not find data module at {data_module_path}")
+        
+        # Load the raw state dict
+        state_dict = torch.load(data_module_path, weights_only=False)
+        
+        # Override the toml_config_path in the state dict
+        state_dict['toml_config_path'] = os.path.abspath(args.data_config)
+        logger.info("Updated toml_config_path to: %s", state_dict['toml_config_path'])
+        
+        # Save to a temporary location in a writable directory
+        with tempfile.NamedTemporaryFile(mode='wb', suffix='.torch', delete=False) as tmp:
+            temp_path = tmp.name
+        torch.save(state_dict, temp_path)
+        logger.info("Saved modified state to temp file: %s", temp_path)
+        
+        # Load the data module from the modified state
+        data_module = PerturbationDataModule.load_state(temp_path)
+        
+        # Clean up temp file
+        os.remove(temp_path)
+    else:
+        data_module_path = os.path.join(run_output_dir, "data_module.torch")
+        if not os.path.exists(data_module_path):
+            raise FileNotFoundError(f"Could not find data module at {data_module_path}")
+        data_module = PerturbationDataModule.load_state(data_module_path)
+    
+    # Only setup data module if we need to load cell data (not using preassembled core cells)
+    custom_core_cells_path = getattr(args, "core_cells_path", None)
+    if custom_core_cells_path is None:
+        data_module.setup(stage="test")
+        logger.info("Loaded data module from %s", data_module_path)
+    else:
+        logger.info("Loaded data module configuration from %s (skipping data setup for preassembled core cells)", data_module_path)
 
     pl.seed_everything(cfg["training"]["train_seed"])
 
@@ -207,7 +254,43 @@ def run_tx_single(args: ap.ArgumentParser, *, phase_one_only: bool = False) -> N
 
     model_name = cfg["model"]["name"]
     model_kwargs = cfg["model"]["kwargs"]
-    var_dims = data_module.get_var_dims()
+    
+    # Get var_dims from checkpoint when using preassembled core cells to avoid loading data
+    if custom_core_cells_path is not None:
+        logger.info("Reading var_dims from checkpoint to avoid loading data")
+        ckpt_state = torch.load(checkpoint_path, weights_only=False, map_location='cpu')
+        var_dims = {}
+        
+        # Extract dimensions from model state dict
+        if 'state_dict' in ckpt_state:
+            state_dict = ckpt_state['state_dict']
+            # Try to infer dimensions from model weights
+            for key in state_dict.keys():
+                if 'pert_emb' in key or 'perturbation_encoder' in key:
+                    if 'weight' in key:
+                        var_dims['pert_dim'] = state_dict[key].shape[0] if state_dict[key].dim() > 1 else state_dict[key].shape[0]
+                if 'cell_encoder' in key or 'encoder.0' in key:
+                    if 'weight' in key and 'input_dim' not in var_dims:
+                        var_dims['input_dim'] = state_dict[key].shape[1] if state_dict[key].dim() > 1 else state_dict[key].shape[0]
+                if 'decoder' in key or 'cell_decoder' in key:
+                    if 'weight' in key and 'output_dim' not in var_dims:
+                        # Output dim is usually the last layer of decoder
+                        if 'decoder.weight' in key or 'cell_decoder.weight' in key:
+                            var_dims['output_dim'] = state_dict[key].shape[0]
+        
+        # Also check hyper_parameters in checkpoint
+        if 'hyper_parameters' in ckpt_state:
+            hp = ckpt_state['hyper_parameters']
+            for dim_key in ['input_dim', 'output_dim', 'pert_dim', 'gene_dim', 'hvg_dim', 'hidden_dim']:
+                if dim_key in hp:
+                    var_dims[dim_key] = hp[dim_key]
+        
+        logger.info("Extracted var_dims from checkpoint: %s", var_dims)
+        
+        if not var_dims or 'input_dim' not in var_dims or 'output_dim' not in var_dims or 'pert_dim' not in var_dims:
+            raise RuntimeError(f"Could not extract required dimensions from checkpoint. Got: {var_dims}")
+    else:
+        var_dims = data_module.get_var_dims()
 
     if model_name.lower() == "embedsum":
         from ...tx.models.embed_sum import EmbedSumPerturbationModel
@@ -266,11 +349,17 @@ def run_tx_single(args: ap.ArgumentParser, *, phase_one_only: bool = False) -> N
 
     data_module.batch_size = 1
     target_celltype = getattr(args, "target_cell_type")
+    # custom_core_cells_path was already loaded earlier to skip data setup
+    if custom_core_cells_path is not None:
+        target_celltype = None
 
     def _create_filtered_loader(module):
+        use_preassembled_core = custom_core_cells_path is not None
+        eval_train = bool(getattr(args, "eval_train_data", False)) and not use_preassembled_core
+
         base_loader = (
             module.train_dataloader(test=True)
-            if args.eval_train_data
+            if eval_train
             else module.test_dataloader()
         )
 
@@ -279,6 +368,11 @@ def run_tx_single(args: ap.ArgumentParser, *, phase_one_only: bool = False) -> N
         def _generator():
             found_target = False
             for batch in base_loader:
+                if use_preassembled_core:
+                    found_target = True
+                    yield batch
+                    continue
+
                 if target_celltype is None:
                     found_target = True
                     yield batch
@@ -331,25 +425,53 @@ def run_tx_single(args: ap.ArgumentParser, *, phase_one_only: bool = False) -> N
 
         return _generator()
 
-    eval_loader = _create_filtered_loader(data_module)
+    # Only create eval_loader if we're not using preassembled core cells
+    if custom_core_cells_path is None:
+        eval_loader = _create_filtered_loader(data_module)
+    else:
+        eval_loader = None
 
     logger.info("Preparing core cells batch and enumerating perturbations...")
 
-    control_pert = data_module.get_control_pert()
-    unique_perts = []
-    seen_perts = set()
-    for batch in eval_loader:
-        names = _to_list(batch.get("pert_name", []))
-        for name in names:
-            name_value = name.item() if isinstance(name, torch.Tensor) else str(name)
-            if name_value not in seen_perts:
-                seen_perts.add(name_value)
-                unique_perts.append(name_value)
-    if not unique_perts:
-        raise RuntimeError("No perturbations found in the provided dataloader.")
+    # Get control_pert - when using preassembled core cells, get it from the data_module attributes
+    if custom_core_cells_path is not None:
+        control_pert = data_module.control_pert
+        logger.info("Using control_pert from data_module config: %s", control_pert)
+    else:
+        control_pert = data_module.get_control_pert()
+    
+    # Load pert_onehot_map early to get perturbations without loading data
+    pert_onehot_map = getattr(data_module, "pert_onehot_map", None)
+    if pert_onehot_map is None:
+        map_path = os.path.join(run_output_dir, "pert_onehot_map.pt")
+        if os.path.exists(map_path):
+            pert_onehot_map = torch.load(map_path, weights_only=False)
+            logger.info("Loaded pert_onehot_map from %s", map_path)
+        else:
+            logger.warning("pert_onehot_map.pt not found at %s", map_path)
+            pert_onehot_map = {}
+    
+    # When using preassembled core cells, get perturbations from pert_onehot_map (no data loading!)
+    # Otherwise enumerate from the filtered eval_loader
+    if custom_core_cells_path is not None and pert_onehot_map:
+        # Use pert_onehot_map to get all perturbations without loading data
+        unique_perts = list(pert_onehot_map.keys())
+        logger.info("Enumerating %d perturbations from pert_onehot_map (using preassembled core cells)", len(unique_perts))
+    else:
+        # Enumerate from dataloader (original behavior)
+        unique_perts = []
+        seen_perts = set()
+        for batch in eval_loader:
+            names = _to_list(batch.get("pert_name", []))
+            for name in names:
+                name_value = name.item() if isinstance(name, torch.Tensor) else str(name)
+                if name_value not in seen_perts:
+                    seen_perts.add(name_value)
+                    unique_perts.append(name_value)
+        if not unique_perts:
+            raise RuntimeError("No perturbations found in the provided dataloader.")
 
     target_core_n_default = 256
-    custom_core_cells_path = getattr(args, "core_cells_path", None)
 
     def _load_core_cells_from_path(path):
         if not os.path.exists(path):
@@ -414,6 +536,40 @@ def run_tx_single(args: ap.ArgumentParser, *, phase_one_only: bool = False) -> N
 
     if custom_core_cells_path:
         core_cells, target_core_n = _load_core_cells_from_path(os.path.abspath(custom_core_cells_path))
+        
+        # Map latent_embedding to ctrl_cell_emb if needed for model compatibility
+        if 'latent_embedding' in core_cells and 'ctrl_cell_emb' not in core_cells:
+            core_cells['ctrl_cell_emb'] = core_cells['latent_embedding']
+            logger.info("Mapped latent_embedding to ctrl_cell_emb for model compatibility")
+        
+        # Map plate to batch if needed for model compatibility
+        if 'plate' in core_cells and 'batch' not in core_cells:
+            plate_data = core_cells['plate']
+            # Check if plate is a list of strings (tensor representations)
+            if isinstance(plate_data, list) and len(plate_data) > 0:
+                if isinstance(plate_data[0], str) and 'tensor' in plate_data[0].lower():
+                    # Parse string tensor representations
+                    import re
+                    parsed_tensors = []
+                    for plate_str in plate_data:
+                        # Extract the numbers from the string representation
+                        numbers = re.findall(r'[-+]?\d*\.?\d+', plate_str)
+                        parsed_tensors.append(torch.tensor([float(n) for n in numbers]))
+                    core_cells['batch'] = torch.stack(parsed_tensors)
+                    logger.info("Parsed %d plate strings to batch tensor with shape %s", len(parsed_tensors), core_cells['batch'].shape)
+                elif isinstance(plate_data[0], torch.Tensor):
+                    core_cells['batch'] = torch.stack(plate_data)
+                    logger.info("Stacked %d plate tensors to batch tensor", len(plate_data))
+                else:
+                    # Assume it's batch indices
+                    core_cells['batch'] = torch.tensor(plate_data)
+                    logger.info("Converted plate list to batch tensor")
+            elif isinstance(plate_data, torch.Tensor):
+                core_cells['batch'] = plate_data
+                logger.info("Using plate tensor as batch")
+            else:
+                logger.warning("Could not convert plate to batch, type: %s", type(plate_data))
+        
         logger.info(
             "Loaded custom core_cells batch with size %d from %s.",
             target_core_n,
@@ -522,14 +678,10 @@ def run_tx_single(args: ap.ArgumentParser, *, phase_one_only: bool = False) -> N
 
     device = next(model.parameters()).device
 
-    pert_onehot_map = getattr(data_module, "pert_onehot_map", None)
-    if pert_onehot_map is None:
-        map_path = os.path.join(run_output_dir, "pert_onehot_map.pt")
-        if os.path.exists(map_path):
-            pert_onehot_map = torch.load(map_path, weights_only=False)
-        else:
-            logger.warning("pert_onehot_map.pt not found at %s; proceeding with zero embeddings", map_path)
-            pert_onehot_map = {}
+    # pert_onehot_map was already loaded earlier for perturbation enumeration
+    if not pert_onehot_map:
+        logger.warning("No pert_onehot_map available; will use zero embeddings for perturbations")
+        pert_onehot_map = {}
 
     def _prepare_pert_emb(pert_name, length):
         vec = pert_onehot_map.get(pert_name)
@@ -567,7 +719,11 @@ def run_tx_single(args: ap.ArgumentParser, *, phase_one_only: bool = False) -> N
             batch_size = batch_preds["preds"].shape[0]
             metadata["pert_name"].extend(_normalize_field(batch_preds.get("pert_name", pert), batch_size, pert))
             metadata["celltype_name"].extend(
-                _normalize_field(batch_preds.get("celltype_name"), batch_size, target_celltype)
+                _normalize_field(
+                    batch_preds.get("celltype_name"),
+                    batch_size,
+                    target_celltype,
+                )
             )
             metadata["batch"].extend(
                 [None if b is None else str(b) for b in _normalize_field(batch_preds.get("batch"), batch_size)]
@@ -580,7 +736,15 @@ def run_tx_single(args: ap.ArgumentParser, *, phase_one_only: bool = False) -> N
             )
 
             batch_pred_np = batch_preds["preds"].detach().cpu().numpy().astype(np.float32)
-            batch_real_np = batch_preds["pert_cell_emb"].detach().cpu().numpy().astype(np.float32)
+            
+            # When using preassembled core cells, pert_cell_emb may not exist (double perturbation case)
+            # Use the input ctrl_cell_emb as the "real" baseline in that case
+            if batch_preds.get("pert_cell_emb") is not None:
+                batch_real_np = batch_preds["pert_cell_emb"].detach().cpu().numpy().astype(np.float32)
+            else:
+                # Use ctrl_cell_emb (the input embeddings) as the baseline
+                batch_real_np = batch["ctrl_cell_emb"].detach().cpu().numpy().astype(np.float32)
+                logger.info("Using ctrl_cell_emb as baseline (pert_cell_emb not available)")
 
             first_pass_preds[p_idx, :, :] = batch_pred_np
             first_pass_real[p_idx, :, :] = batch_real_np
