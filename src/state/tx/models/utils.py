@@ -226,13 +226,13 @@ class LlamaBidirectionalModel(LlamaModel):
         self.rotary_emb = NoRoPE(
             head_dim=config.head_dim,
         )
-        
+
         # Explicitly disable causal attention
         self.config.is_causal = False
         # force every layer to be non-causal
         for layer in self.layers:
             if hasattr(layer, "self_attn"):
-                layer.self_attn.is_causal = False   # pyright: ignore[reportAttributeAccessIssue, reportArgumentType]
+                layer.self_attn.is_causal = False  # pyright: ignore[reportAttributeAccessIssue, reportArgumentType]
 
     def _update_causal_mask(
         self,
@@ -261,7 +261,7 @@ class LlamaBidirectionalModel(LlamaModel):
         **flash_attn_kwargs,
     ):
         flash_attn_kwargs["is_causal"] = False
-        
+
         # If no attention_mask is provided, create an all-ones mask (no masking)
         # This ensures bidirectional attention with correct device/dtype
         if attention_mask is None:
