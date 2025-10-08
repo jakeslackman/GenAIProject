@@ -485,9 +485,21 @@ def run_tx_combo(args: ap.Namespace) -> None:
 
     used_output_names: dict[str, int] = {}
     written_files: list[str] = []
+    skipped_perts: list[str] = []
+
+    try:
+        existing_output_names = {
+            os.path.splitext(fname)[0]
+            for fname in os.listdir(output_dir)
+            if fname.endswith(".h5ad")
+        }
+    except OSError:
+        existing_output_names = set()
+
+    num_target_perts = len(perts)
 
     with torch.no_grad():
-        progress_total = len(perts) * len(perts)
+        progress_total = num_target_perts * num_target_perts
         progress_bar = tqdm(
             total=progress_total,
             desc="Combo sweeps",
@@ -495,6 +507,18 @@ def run_tx_combo(args: ap.Namespace) -> None:
             disable=args.quiet,
         )
         for pert1 in perts:
+            base_name = _sanitize_filename(pert1)
+            occurrence_idx = used_output_names.get(base_name, -1) + 1
+            used_output_names[base_name] = occurrence_idx
+            output_name = base_name if occurrence_idx == 0 else f"{base_name}_{occurrence_idx}"
+            output_path = os.path.join(output_dir, f"{output_name}.h5ad")
+
+            if output_name in existing_output_names or os.path.exists(output_path):
+                skipped_perts.append(pert1)
+                progress_bar.update(num_target_perts)
+                logger.info("Skipping combos for %s; existing output at %s", pert1, output_path)
+                continue
+
             per_pert_X_blocks: list[np.ndarray] = []
             per_pert_latent_blocks: list[np.ndarray] = []
             per_pert_obs_rows: list[dict[str, str | int]] = []
@@ -599,18 +623,13 @@ def run_tx_combo(args: ap.Namespace) -> None:
             combo_adata.uns["inner_batch_size"] = inner_batch_size
             combo_adata.uns["sampled_control_indices"] = adata_ct.obs_names[sampled_idx].tolist()
 
-            output_name = _sanitize_filename(pert1)
-            if output_name in used_output_names:
-                used_output_names[output_name] += 1
-                output_name = f"{output_name}_{used_output_names[output_name]}"
-            else:
-                used_output_names[output_name] = 0
-
-            output_path = os.path.join(output_dir, f"{output_name}.h5ad")
             combo_adata.write_h5ad(output_path)
             written_files.append(output_path)
+            existing_output_names.add(output_name)
             logger.info("Saved combos for %s with %d cells to %s", pert1, combo_adata.n_obs, output_path)
 
         progress_bar.close()
 
     logger.info("Finished writing %d combo files to %s", len(written_files), output_dir)
+    if skipped_perts:
+        logger.info("Skipped %d perturbations with existing combo outputs", len(skipped_perts))

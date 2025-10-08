@@ -1,4 +1,5 @@
 import argparse
+import ast
 from typing import Dict, List, Optional
 import pandas as pd
 
@@ -22,6 +23,12 @@ def add_arguments_infer(parser: argparse.ArgumentParser):
         type=str,
         default="drugname_drugconc",
         help="Column in adata.obs for perturbation labels",
+    )
+    parser.add_argument(
+        "--dosages",
+        type=str,
+        default=None,
+        help="Optional list of dosages (floats) to materialize for each perturbation, e.g. \"[0.1, 0.5, 1.0]\".",
     )
     parser.add_argument(
         "--output",
@@ -168,12 +175,115 @@ def run_tx_infer(args: argparse.Namespace):
             return int(v)
         return None
 
+    def parse_dosage_argument(arg_value: Optional[str]) -> List[float]:
+        if arg_value is None:
+            return []
+        if isinstance(arg_value, (list, tuple)):
+            candidate_values = arg_value
+        else:
+            text = str(arg_value).strip()
+            if not text:
+                return []
+            parsed = None
+            try:
+                parsed = ast.literal_eval(text)
+            except (ValueError, SyntaxError):
+                parsed = None
+            if isinstance(parsed, (list, tuple)):
+                candidate_values = parsed
+            else:
+                text = text.strip("[]")
+                parts = [p for p in text.replace(",", " ").split() if p]
+                candidate_values = parts
+        deduped: List[float] = []
+        seen: set[float] = set()
+        for value in candidate_values:
+            try:
+                val = float(value)
+            except (TypeError, ValueError):
+                raise ValueError(f"Invalid dosage value '{value}' in --dosages argument.")
+            key = round(val, 12)
+            if key not in seen:
+                seen.add(key)
+                deduped.append(val)
+        return deduped
+
+    def extend_perturbation_map_for_dosages(
+        pert_map: Dict[str, torch.Tensor],
+        requested_dosages: List[float],
+        *,
+        control_label: Optional[str],
+        quiet: bool,
+    ) -> List[str]:
+        if not requested_dosages:
+            return []
+
+        def almost_equal(a: float, b: float, tol: float = 1e-9) -> bool:
+            return abs(a - b) <= tol
+
+        canonical_vectors: Dict[tuple[str, Optional[str]], Dict[str, object]] = {}
+        for key, vec in pert_map.items():
+            key_str = str(key)
+            if control_label is not None and key_str == control_label:
+                continue
+            try:
+                parsed = ast.literal_eval(key_str)
+            except (ValueError, SyntaxError):
+                continue
+            if not isinstance(parsed, (list, tuple)) or len(parsed) != 1:
+                continue
+            entry = parsed[0]
+            if not isinstance(entry, (list, tuple)) or len(entry) < 2:
+                continue
+            pert_name = str(entry[0])
+            unit = str(entry[2]) if len(entry) > 2 else None
+            try:
+                dose_val = float(entry[1])
+            except (TypeError, ValueError):
+                continue
+
+            base_key = (pert_name, unit)
+            base_info = canonical_vectors.setdefault(
+                base_key,
+                {
+                    "template_key": key_str,
+                    "unit": unit,
+                    "existing": [],
+                    "vector": vec,
+                },
+            )
+            existing: List[float] = base_info["existing"]  # type: ignore[assignment]
+            if not any(almost_equal(dose_val, existing_dose) for existing_dose in existing):
+                existing.append(dose_val)
+            # Prefer first encountered vector as canonical; assume all are equivalent
+
+        added_keys: List[str] = []
+        for (pert_name, unit), info in canonical_vectors.items():
+            vector: torch.Tensor = info["vector"]  # type: ignore[assignment]
+            existing: List[float] = info["existing"]  # type: ignore[assignment]
+            for dosage in requested_dosages:
+                if any(almost_equal(dosage, existing_dose) for existing_dose in existing):
+                    continue
+                if unit is None:
+                    new_entry = [(pert_name, float(dosage))]
+                else:
+                    new_entry = [(pert_name, float(dosage), unit)]
+                key_str = str(new_entry)
+                if key_str in pert_map:
+                    continue
+                pert_map[key_str] = vector.clone()
+                added_keys.append(key_str)
+        if added_keys and not quiet:
+            print(f"Extended perturbation map with {len(added_keys)} dosage variants.")
+        return added_keys
+
     def prepare_batch(
         ctrl_basal_np: np.ndarray,
         pert_onehots: torch.Tensor,
         batch_indices: Optional[torch.Tensor],
         pert_names: List[str],
         device: torch.device,
+        pert_dosage: Optional[float] = None,
     ) -> Dict[str, torch.Tensor | List[str]]:
         """
         Construct a model batch with variable-length sentence (B=1, S=T, ...).
@@ -187,6 +297,14 @@ def run_tx_infer(args: argparse.Namespace):
         }
         if batch_indices is not None:
             batch["batch"] = batch_indices.to(device)  # [T]
+        if pert_dosage is not None:
+            seq_len = X_batch.shape[0]
+            batch["pert_dosage"] = torch.full(
+                (seq_len,),
+                float(pert_dosage),
+                dtype=torch.float32,
+                device=device,
+            )
         return batch
 
     def pad_adata_with_tsv(
@@ -340,6 +458,12 @@ def run_tx_infer(args: argparse.Namespace):
         print(f"Control perturbation: {control_pert}")
     control_pert_str = str(control_pert)
 
+    requested_dosages = parse_dosage_argument(args.dosages)
+    if requested_dosages and not args.quiet:
+        print(f"Requested dosages: {requested_dosages}")
+    if requested_dosages and not args.all_perts and not args.quiet:
+        print("Note: --dosages provided without --all-perts; only dosages present in AnnData will be simulated.")
+
     # choose cell type column
     if args.celltype_col is None:
         ct_from_cfg = None
@@ -379,6 +503,14 @@ def run_tx_infer(args: argparse.Namespace):
     if not os.path.exists(pert_onehot_map_path):
         raise FileNotFoundError(f"Missing pert_onehot_map.pt at {pert_onehot_map_path}")
     pert_onehot_map: Dict[str, torch.Tensor] = torch.load(pert_onehot_map_path, weights_only=False)
+    added_dosage_keys = extend_perturbation_map_for_dosages(
+        pert_map=pert_onehot_map,
+        requested_dosages=requested_dosages,
+        control_label=control_pert_str,
+        quiet=args.quiet,
+    )
+    if requested_dosages and not added_dosage_keys and not args.quiet:
+        print("No new dosage variants were added; requested values may already exist in the perturbation map.")
     pert_name_lookup: Dict[str, object] = {str(k): k for k in pert_onehot_map.keys()}
     pert_names_in_map: List[str] = list(pert_name_lookup.keys())
 
@@ -717,6 +849,11 @@ def run_tx_infer(args: argparse.Namespace):
                     vec = default_pert_vec
                     if not args.quiet:
                         print(f"  (group {g}) pert '{p}' not in mapping; using control fallback one-hot.")
+                dosage_value = (
+                    StateTransitionPerturbationModel._parse_dosage_from_name(p)
+                    if getattr(model, "use_dosage_encoder", False)
+                    else None
+                )
 
                 start = 0
                 while start < len(idxs):
@@ -744,6 +881,7 @@ def run_tx_infer(args: argparse.Namespace):
                         batch_indices=bi,
                         pert_names=[p] * win_size,
                         device=model_device,
+                        pert_dosage=dosage_value,
                     )
                     batch_out = model.predict_step(batch, batch_idx=0, padded=False)
 
