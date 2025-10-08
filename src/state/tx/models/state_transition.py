@@ -661,7 +661,7 @@ class StateTransitionPerturbationModel(PerturbationModel):
         dose_per_sentence = dose[:, 0, 0]  # [B]
 
         # One drug label per sentence (best effort)
-       groups = None
+        groups = None
         names = batch.get("pert_name", None)
         if names is not None:
             if isinstance(names, torch.Tensor):
