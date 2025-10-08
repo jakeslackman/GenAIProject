@@ -560,15 +560,9 @@ def run_tx_combo(args: ap.Namespace) -> None:
 
                     progress_bar.update(1)
 
-            X_matrix = (
-                np.vstack(per_pert_X_blocks)
-                if per_pert_X_blocks
-                else np.empty((0, 0), dtype=np.float32)
-            )
+            X_matrix = np.vstack(per_pert_X_blocks) if per_pert_X_blocks else np.empty((0, 0), dtype=np.float32)
             latent_matrix = (
-                np.vstack(per_pert_latent_blocks)
-                if per_pert_latent_blocks
-                else np.empty((0, 0), dtype=np.float32)
+                np.vstack(per_pert_latent_blocks) if per_pert_latent_blocks else np.empty((0, 0), dtype=np.float32)
             )
             obs_df = pd.DataFrame(per_pert_obs_rows)
 

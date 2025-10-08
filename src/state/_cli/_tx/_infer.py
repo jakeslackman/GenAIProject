@@ -513,17 +513,16 @@ def run_tx_infer(args: argparse.Namespace):
             clone.obs = clone.obs.copy()
             clone.obs[args.pert_col] = pert_name
             base_names = list(clone.obs_names)
-            clone.obs_names = [
-                f"{obs_name}__virt_{pert_name}__pad{idx+1}"
-                for idx, obs_name in enumerate(base_names)
-            ]
+            clone.obs_names = [f"{obs_name}__virt_{pert_name}__pad{idx + 1}" for idx, obs_name in enumerate(base_names)]
             virtual_blocks.append(clone)
 
         if virtual_blocks:
             adata = sc.concat([adata, *virtual_blocks], axis=0, join="inner")
             if not args.quiet:
                 preview = ", ".join(
-                    [f"{pert}:{args.min_cells}" for pert, cnt in pert_counts.items() if int(cnt) < int(args.min_cells)][:5]
+                    [f"{pert}:{args.min_cells}" for pert, cnt in pert_counts.items() if int(cnt) < int(args.min_cells)][
+                        :5
+                    ]
                 )
                 if len(virtual_blocks) > 5:
                     preview += ", ..."

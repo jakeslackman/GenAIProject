@@ -563,7 +563,9 @@ class StateTransitionPerturbationModel(PerturbationModel):
             pert_names = batch.get("pert_name")
             if pert_names is None:
                 if not self._warned_missing_dosage:
-                    logger.warning("Dosage encoder enabled but no dosage information found in batch; skipping dosage term.")
+                    logger.warning(
+                        "Dosage encoder enabled but no dosage information found in batch; skipping dosage term."
+                    )
                     self._warned_missing_dosage = True
                 return None
 
@@ -576,7 +578,9 @@ class StateTransitionPerturbationModel(PerturbationModel):
             dosage_tensor = torch.tensor(dosage_list, device=device, dtype=torch.float32)
 
             if not self._warned_missing_dosage:
-                logger.warning("Falling back to parsing dosage from perturbation names; consider providing 'pert_dosage'.")
+                logger.warning(
+                    "Falling back to parsing dosage from perturbation names; consider providing 'pert_dosage'."
+                )
                 self._warned_missing_dosage = True
 
         dosage_tensor = dosage_tensor.flatten()
