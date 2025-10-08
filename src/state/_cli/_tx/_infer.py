@@ -475,7 +475,7 @@ def run_tx_infer(args: argparse.Namespace):
                 clone.obs_names = [f"{obs_name}__virt_{pert_name}" for obs_name in clone.obs_names]
                 virtual_blocks.append(clone)
 
-            adata = sc.concat([adata, *virtual_blocks], axis=0, join="same", label=None, index_unique=None)
+            adata = sc.concat([adata, *virtual_blocks], axis=0, join="inner")
 
             if not args.quiet:
                 preview = ", ".join(missing_perts[:5])
@@ -520,7 +520,7 @@ def run_tx_infer(args: argparse.Namespace):
             virtual_blocks.append(clone)
 
         if virtual_blocks:
-            adata = sc.concat([adata, *virtual_blocks], axis=0, join="same", label=None, index_unique=None)
+            adata = sc.concat([adata, *virtual_blocks], axis=0, join="inner")
             if not args.quiet:
                 preview = ", ".join(
                     [f"{pert}:{args.min_cells}" for pert, cnt in pert_counts.items() if int(cnt) < int(args.min_cells)][:5]
