@@ -326,7 +326,7 @@ def run_tx_single(args: ap.ArgumentParser, *, phase_one_only: bool = False) -> N
         **model_kwargs,
     }
 
-    for optional_key in ("gene_dim", "hvg_dim"):
+    for optional_key in ("gene_dim", "hvg_dim", "batch_dim"):
         optional_value = var_dims.get(optional_key)
         if optional_value is not None:
             model_init_kwargs[optional_key] = optional_value
@@ -334,12 +334,115 @@ def run_tx_single(args: ap.ArgumentParser, *, phase_one_only: bool = False) -> N
     if "hidden_dim" in var_dims and "hidden_dim" not in model_init_kwargs:
         model_init_kwargs["hidden_dim"] = var_dims["hidden_dim"]
 
-    model = ModelClass.load_from_checkpoint(
-        checkpoint_path,
-        **model_init_kwargs,
-    )
-    model.eval()
-    logger.info("Model loaded successfully.")
+    # Add embed_key from data module if not already present
+    if "embed_key" not in model_init_kwargs:
+        embed_key = getattr(data_module, "embed_key", None) or "latent_embedding"
+        model_init_kwargs["embed_key"] = embed_key
+    
+    # Add output_space from config if not already present
+    if "output_space" not in model_init_kwargs:
+        output_space = cfg["data"]["kwargs"].get("output_space", "embedding")
+        model_init_kwargs["output_space"] = output_space
+
+    # Load checkpoint and handle dimension mismatches
+    checkpoint_state = torch.load(checkpoint_path, weights_only=False, map_location='cpu')
+    
+    # Handle pert_encoder dimension mismatch
+    pert_encoder_weight_key = "pert_encoder.0.weight"
+    if pert_encoder_weight_key in checkpoint_state["state_dict"]:
+        checkpoint_pert_dim = checkpoint_state["state_dict"][pert_encoder_weight_key].shape[1]
+        current_pert_dim = model_init_kwargs.get("pert_dim", var_dims["pert_dim"])
+        
+        if checkpoint_pert_dim != current_pert_dim:
+            logger.warning(
+                "pert_encoder dimension mismatch: checkpoint has %d dims, current model needs %d dims. "
+                "Using first %d dimensions from checkpoint and zeroing the rest.",
+                checkpoint_pert_dim, current_pert_dim, min(checkpoint_pert_dim, current_pert_dim)
+            )
+            
+            # Get checkpoint weights
+            checkpoint_weight = checkpoint_state["state_dict"][pert_encoder_weight_key]
+            
+            # Create new weight tensor with current model dimensions  
+            new_weight = torch.zeros(checkpoint_weight.shape[0], current_pert_dim)
+            
+            # Copy available dimensions (use min of both dimensions)
+            min_dim = min(checkpoint_pert_dim, current_pert_dim)
+            new_weight[:, :min_dim] = checkpoint_weight[:, :min_dim]
+            
+            # Update the checkpoint state dict
+            checkpoint_state["state_dict"][pert_encoder_weight_key] = new_weight
+            
+            logger.info(
+                "Updated pert_encoder.0.weight: copied %d/%d input dimensions",
+                min_dim, current_pert_dim
+            )
+            
+            # Update the model_init_kwargs to match what's actually in the checkpoint
+            # but keep our adjusted pert_dim
+            model_init_kwargs["pert_dim"] = current_pert_dim
+    
+    # Handle batch_encoder dimension mismatch
+    batch_encoder_weight_key = "batch_encoder.weight"
+    if batch_encoder_weight_key in checkpoint_state["state_dict"]:
+        checkpoint_batch_dim = checkpoint_state["state_dict"][batch_encoder_weight_key].shape[0]
+        current_batch_dim = model_init_kwargs.get("batch_dim")
+        
+        if current_batch_dim is not None and checkpoint_batch_dim != current_batch_dim:
+            logger.warning(
+                "batch_encoder dimension mismatch: checkpoint has %d batch categories, current model needs %d. "
+                "Using first %d categories from checkpoint and zeroing the rest.",
+                checkpoint_batch_dim, current_batch_dim, min(checkpoint_batch_dim, current_batch_dim)
+            )
+            
+            # Get checkpoint weights
+            checkpoint_weight = checkpoint_state["state_dict"][batch_encoder_weight_key]
+            
+            # Create new weight tensor with current model dimensions
+            new_weight = torch.zeros(current_batch_dim, checkpoint_weight.shape[1])
+            
+            # Copy available dimensions (use min of both dimensions)
+            min_dim = min(checkpoint_batch_dim, current_batch_dim)
+            new_weight[:min_dim, :] = checkpoint_weight[:min_dim, :]
+            
+            # Update the checkpoint state dict
+            checkpoint_state["state_dict"][batch_encoder_weight_key] = new_weight
+            
+            logger.info(
+                "Updated batch_encoder.weight: copied %d/%d batch categories",
+                min_dim, current_batch_dim
+            )
+        elif current_batch_dim is None:
+            # If current model doesn't expect batch_encoder, use checkpoint's batch_dim
+            model_init_kwargs["batch_dim"] = checkpoint_batch_dim
+            logger.info("Using checkpoint's batch_dim: %d", checkpoint_batch_dim)
+    
+    # Extract additional parameters from checkpoint hyperparameters if available
+    if "hyper_parameters" in checkpoint_state:
+        hp = checkpoint_state["hyper_parameters"]
+        for param_key in ["batch_dim", "cell_sentence_len", "batch_encoder", "predict_mean"]:
+            if param_key in hp and param_key not in model_init_kwargs:
+                model_init_kwargs[param_key] = hp[param_key]
+                logger.debug("Added %s=%s from checkpoint hyperparameters", param_key, hp[param_key])
+    
+    # Save the modified checkpoint to a temporary file and load from there
+    import tempfile
+    with tempfile.NamedTemporaryFile(mode='wb', suffix='.ckpt', delete=False) as tmp:
+        temp_checkpoint_path = tmp.name
+    torch.save(checkpoint_state, temp_checkpoint_path)
+    
+    try:
+        # Load model using Lightning's checkpoint loading mechanism
+        model = ModelClass.load_from_checkpoint(
+            temp_checkpoint_path,
+            **model_init_kwargs,
+        )
+        model.eval()
+        logger.info("Model loaded successfully.")
+    finally:
+        # Clean up temporary file
+        import os
+        os.remove(temp_checkpoint_path)
 
     results_dir_default = (
         args.results_dir
@@ -451,14 +554,13 @@ def run_tx_single(args: ap.ArgumentParser, *, phase_one_only: bool = False) -> N
             logger.warning("pert_onehot_map.pt not found at %s", map_path)
             pert_onehot_map = {}
     
-    # When using preassembled core cells, get perturbations from pert_onehot_map (no data loading!)
-    # Otherwise enumerate from the filtered eval_loader
-    if custom_core_cells_path is not None and pert_onehot_map:
-        # Use pert_onehot_map to get all perturbations without loading data
+    # Use pert_onehot_map to get all perturbations if available, otherwise enumerate from dataloader
+    if pert_onehot_map:
+        # Use pert_onehot_map to get all perturbations (preferred approach)
         unique_perts = list(pert_onehot_map.keys())
-        logger.info("Enumerating %d perturbations from pert_onehot_map (using preassembled core cells)", len(unique_perts))
+        logger.info("Enumerating %d perturbations from pert_onehot_map", len(unique_perts))
     else:
-        # Enumerate from dataloader (original behavior)
+        # Fallback: enumerate from dataloader (may be limited by cell type filtering)
         unique_perts = []
         seen_perts = set()
         for batch in eval_loader:
@@ -470,8 +572,14 @@ def run_tx_single(args: ap.ArgumentParser, *, phase_one_only: bool = False) -> N
                     unique_perts.append(name_value)
         if not unique_perts:
             raise RuntimeError("No perturbations found in the provided dataloader.")
+        logger.warning(
+            "Using perturbations from filtered dataloader (%d found). "
+            "This may be limited by --target-cell-type filtering. "
+            "Consider using pert_onehot_map for complete perturbation coverage.",
+            len(unique_perts)
+        )
 
-    target_core_n_default = 256
+    target_core_n_default = 64
 
     def _load_core_cells_from_path(path):
         if not os.path.exists(path):
@@ -569,6 +677,40 @@ def run_tx_single(args: ap.ArgumentParser, *, phase_one_only: bool = False) -> N
                 logger.info("Using plate tensor as batch")
             else:
                 logger.warning("Could not convert plate to batch, type: %s", type(plate_data))
+        
+        # Ensure batch tensor matches model's expected batch_dim
+        if 'batch' in core_cells and isinstance(core_cells['batch'], torch.Tensor):
+            current_batch_dim = core_cells['batch'].shape[-1] if core_cells['batch'].dim() > 1 else core_cells['batch'].max().item() + 1
+            expected_batch_dim = model_init_kwargs.get('batch_dim')
+            
+            if expected_batch_dim is not None and current_batch_dim != expected_batch_dim:
+                logger.warning(
+                    "Batch dimension mismatch: core cells have %d batch categories, model expects %d. "
+                    "Adjusting batch tensor to match model expectations.",
+                    current_batch_dim, expected_batch_dim
+                )
+                
+                if core_cells['batch'].dim() > 1:
+                    # One-hot encoded batch tensor
+                    if current_batch_dim < expected_batch_dim:
+                        # Pad with zeros
+                        padding_size = expected_batch_dim - current_batch_dim
+                        padding = torch.zeros(core_cells['batch'].shape[0], padding_size)
+                        core_cells['batch'] = torch.cat([core_cells['batch'], padding], dim=1)
+                        logger.info("Padded batch tensor from %d to %d dimensions", current_batch_dim, expected_batch_dim)
+                    elif current_batch_dim > expected_batch_dim:
+                        # Truncate
+                        core_cells['batch'] = core_cells['batch'][:, :expected_batch_dim]
+                        logger.info("Truncated batch tensor from %d to %d dimensions", current_batch_dim, expected_batch_dim)
+                else:
+                    # Index-based batch tensor - convert to one-hot
+                    batch_indices = core_cells['batch'].long()
+                    # Ensure indices are within expected range
+                    batch_indices = torch.clamp(batch_indices, 0, expected_batch_dim - 1)
+                    # Convert to one-hot
+                    core_cells['batch'] = torch.zeros(batch_indices.shape[0], expected_batch_dim)
+                    core_cells['batch'].scatter_(1, batch_indices.unsqueeze(1), 1)
+                    logger.info("Converted batch indices to one-hot encoding with %d categories", expected_batch_dim)
         
         logger.info(
             "Loaded custom core_cells batch with size %d from %s.",
@@ -687,11 +829,28 @@ def run_tx_single(args: ap.ArgumentParser, *, phase_one_only: bool = False) -> N
         vec = pert_onehot_map.get(pert_name)
         if vec is None and control_pert in pert_onehot_map:
             vec = pert_onehot_map[control_pert]
+        
+        pert_dim = getattr(model, "pert_dim", var_dims.get("pert_dim", 0))
+        if pert_dim <= 0:
+            raise RuntimeError("pert_dim is undefined; cannot create perturbation embedding")
+            
         if vec is None:
-            pert_dim = getattr(model, "pert_dim", var_dims.get("pert_dim", 0))
-            if pert_dim <= 0:
-                raise RuntimeError("pert_dim is undefined; cannot create perturbation embedding")
+            # Create zero vector if perturbation not found
             vec = torch.zeros(pert_dim)
+            logger.debug("Created zero perturbation vector for %s (not found in pert_onehot_map)", pert_name)
+        else:
+            # Handle dimension mismatch between pert_onehot_map and model's pert_dim
+            if vec.shape[0] != pert_dim:
+                if vec.shape[0] > pert_dim:
+                    # Truncate if vector is longer than expected (use first pert_dim dimensions)
+                    logger.debug("Truncating perturbation vector for %s from %d to %d", pert_name, vec.shape[0], pert_dim)
+                    vec = vec[:pert_dim]
+                else:
+                    # Pad with zeros if vector is shorter than expected
+                    logger.debug("Padding perturbation vector for %s from %d to %d", pert_name, vec.shape[0], pert_dim)
+                    padding = torch.zeros(pert_dim - vec.shape[0])
+                    vec = torch.cat([vec, padding])
+        
         return vec.float().unsqueeze(0).repeat(length, 1).to(device)
 
     with torch.no_grad():
@@ -854,6 +1013,17 @@ def run_tx_single(args: ap.ArgumentParser, *, phase_one_only: bool = False) -> N
         )
         return
 
+    # Check if we have enough perturbations for meaningful evaluation
+    total_unique_perts = first_pass_real_adata.obs[pert_col].nunique()
+    if total_unique_perts < 2:
+        logger.warning(
+            "Insufficient perturbations for evaluation (%d found). "
+            "Differential expression analysis requires at least 2 perturbations. "
+            "This may be due to --target-cell-type filtering or missing pert_onehot_map.",
+            total_unique_perts
+        )
+        return
+
     pdex_kwargs = dict(exp_post_agg=True, is_log1p=True)
     for celltype in ct_split_real.keys():
         real_ct = ct_split_real[celltype]
@@ -888,3 +1058,4 @@ def run_tx_single(args: ap.ArgumentParser, *, phase_one_only: bool = False) -> N
 def save_core_cells_real_preds(args: ap.ArgumentParser) -> None:
     """Run only phase one of the pipeline and persist real core-cell embeddings per perturbation."""
     return run_tx_single(args, phase_one_only=True)
+
