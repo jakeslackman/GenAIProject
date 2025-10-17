@@ -797,11 +797,25 @@ def run_tx_infer(args: argparse.Namespace):
 
     # Where we will write predictions (initialize with originals; we overwrite all rows, including controls)
     if writes_to[0] == ".X":
-        sim_X = X_in.copy()
+        sim_X = X_in.astype(np.float32, copy=True)
         out_target = "X"
     else:
-        sim_obsm = X_in.copy()
+        sim_obsm = X_in.astype(np.float32, copy=True)
         out_target = f"obsm['{writes_to[1]}']"
+
+    counts_expected = output_space in {"gene", "all"}
+    counts_out_target: Optional[str] = None
+    counts_obsm_key: Optional[str] = None
+    sim_counts: Optional[np.ndarray] = None
+    counts_written = False
+
+    if output_space == "gene":
+        counts_out_target = "obsm['X_hvg']"
+        counts_obsm_key = "X_hvg"
+    elif output_space == "all":
+        counts_out_target = "X"
+        if writes_to[0] == ".X":
+            sim_counts = sim_X
 
     # Group labels for set-to-set behavior
     if args.celltype_col and args.celltype_col in adata.obs:
@@ -920,6 +934,43 @@ def run_tx_infer(args: argparse.Namespace):
                     else:
                         preds = batch_out["preds"].detach().cpu().numpy().astype(np.float32)  # [win, D]
 
+                    counts_preds = None
+                    if counts_expected and ("pert_cell_counts_preds" in batch_out):
+                        counts_tensor = batch_out.get("pert_cell_counts_preds")
+                        if counts_tensor is not None:
+                            counts_preds = counts_tensor.detach().cpu().numpy().astype(np.float32)
+
+                    if counts_preds is not None:
+                        if sim_counts is None:
+                            target_dim = counts_preds.shape[1]
+                            if output_space == "gene":
+                                if counts_obsm_key and counts_obsm_key in adata.obsm:
+                                    existing = np.asarray(adata.obsm[counts_obsm_key])
+                                    if existing.shape[1] == target_dim:
+                                        sim_counts = existing.astype(np.float32, copy=True)
+                                    else:
+                                        if not args.quiet:
+                                            print(
+                                                f"Dimension mismatch for existing obsm['{counts_obsm_key}'] "
+                                                f"(got {existing.shape[1]} vs predictions {target_dim}). "
+                                                "Reinitializing storage with zeros."
+                                            )
+                                        sim_counts = np.zeros((n_total, target_dim), dtype=np.float32)
+                                else:
+                                    sim_counts = np.zeros((n_total, target_dim), dtype=np.float32)
+                            else:  # output_space == "all"
+                                if writes_to[0] == ".X":
+                                    sim_counts = sim_X
+                                else:
+                                    sim_counts = np.zeros((n_total, target_dim), dtype=np.float32)
+                        if sim_counts.shape[1] != counts_preds.shape[1]:
+                            raise ValueError(
+                                "Predicted counts dimension mismatch: "
+                                f"expected {sim_counts.shape[1]} but got {counts_preds.shape[1]}"
+                            )
+                        sim_counts[idx_window, :] = counts_preds
+                        counts_written = True
+
                     # 6) Write predictions for these rows (controls included)
                     if writes_to[0] == ".X":
                         if preds.shape[1] == sim_X.shape[1]:
@@ -958,6 +1009,12 @@ def run_tx_infer(args: argparse.Namespace):
     output_path = args.output or args.adata.replace(".h5ad", "_simulated.h5ad")
     output_is_npy = output_path.lower().endswith(".npy")
 
+    if counts_expected and not counts_written and not args.quiet:
+        print(
+            "Warning: Model configured to produce gene counts, but no predicted counts were returned; "
+            "counts will not be saved."
+        )
+
     pred_matrix = None
     if writes_to[0] == ".X":
         if out_target == "X":
@@ -977,6 +1034,13 @@ def run_tx_infer(args: argparse.Namespace):
             pred_matrix = adata.obsm.get(pred_key)
         else:
             pred_matrix = sim_obsm
+
+    if counts_written and sim_counts is not None:
+        if output_space == "gene":
+            key = counts_obsm_key or "X_hvg"
+            adata.obsm[key] = sim_counts
+        elif output_space == "all":
+            adata.X = sim_counts
 
     if output_is_npy:
         if pred_matrix is None:
@@ -999,3 +1063,5 @@ def run_tx_infer(args: argparse.Namespace):
     else:
         print(f"Wrote predictions to adata.{out_target}")
         print(f"Saved:               {output_path}")
+    if counts_written and counts_out_target:
+        print(f"Saved count predictions to adata.{counts_out_target}")
