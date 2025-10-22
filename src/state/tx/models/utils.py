@@ -1,8 +1,22 @@
-from typing import Union
+from __future__ import annotations
+
+import logging
+from typing import Optional, Union
 
 import torch
 import torch.nn as nn
-from transformers import GPT2Config, GPT2Model, LlamaConfig, LlamaModel, PreTrainedModel
+import torch.nn.functional as F
+from transformers import (
+    GPT2Config,
+    GPT2Model,
+    LlamaConfig,
+    LlamaModel,
+    DeepseekV3Config,
+    DeepseekV3Model,
+    PreTrainedModel,
+    PretrainedConfig,
+)
+from transformers.modeling_outputs import BaseModelOutput
 
 # LoRA / PEFT
 try:
@@ -11,6 +25,8 @@ except Exception:  # pragma: no cover - optional dependency
     LoraConfig = None  # type: ignore
     get_peft_model = None  # type: ignore
     TaskType = None  # type: ignore
+
+logger = logging.getLogger(__name__)
 
 
 def build_mlp(
@@ -124,6 +140,10 @@ def get_transformer_backbone(key, kwargs) -> PreTrainedModel:
 
         model.embed_tokens.weight.requires_grad = False
         model.embed_tokens.weight.zero_()
+    elif key.lower() in {"deepseek", "deepseek_moe"}:
+        config = build_deepseek_config(kwargs)
+        model = DeepseekMoEModel(config)
+        model_dim = config.hidden_size
     else:
         raise ValueError(f"Unknown backbone key {key}")
 
@@ -384,3 +404,76 @@ class GPT2BidirectionalModel(GPT2Model):
             return_dict=return_dict,
             **kwargs,
         )
+
+class DeepseekBidirectionalModel(DeepseekV3Model):
+    """
+    A drop-in replacement for DeepseekV3Model with bidirectional attention.
+    By overriding _update_causal_mask to return None, all tokens attend to each other.
+    """
+
+    def __init__(self, config: DeepseekV3Config):
+        super().__init__(config)
+
+        self.rotary_emb = NoRoPE(
+            head_dim=config.head_dim,
+        )
+
+        self.config.is_causal = False
+        # force every layer to be non-causal
+        for layer in self.layers:
+            if hasattr(layer, "self_attn"):
+                layer.self_attn.is_causal = False
+
+        self.config.num_experts_per_tok = 1
+        self.config.n_routed_experts = 8 # num datasets to train on
+        self.config.n_shared_experts = 1
+
+
+    
+    def _update_causal_mask(
+        self,
+        attention_mask: torch.Tensor,
+        input_tensor: torch.Tensor,
+        cache_position: torch.Tensor,
+        past_key_values,
+        output_attentions: bool = False,
+    ):
+        return None
+    
+    def forward(
+        self,
+        input_ids: torch.LongTensor = None,
+        attention_mask: torch.Tensor | None = None,
+        position_ids: torch.LongTensor = None,
+        past_key_values=None,
+        inputs_embeds: torch.FloatTensor = None,
+        use_cache: bool = None,
+        output_attentions: bool = None,
+        output_hidden_states: bool = None,
+        cache_position: torch.LongTensor = None,
+        **flash_attn_kwargs,
+    ):
+        flash_attn_kwargs["is_causal"] = False
+        if attention_mask is None:
+            B = None
+            S = None
+            if inputs_embeds is not None:
+                B, S = inputs_embeds.size(0), inputs_embeds.size(1)
+            if B and S:
+                attention_mask = torch.ones((B, 1, S, S), dtype=torch.float, device=inputs_embeds.device)
+
+        return super().forward(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+            past_key_values=past_key_values,
+            inputs_embeds=inputs_embeds,
+            use_cache=use_cache,
+            output_attentions=output_attentions,
+            output_hidden_states=output_hidden_states,
+            cache_position=cache_position,
+            **flash_attn_kwargs,
+        )
+    
+
+    
