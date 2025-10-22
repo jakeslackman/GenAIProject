@@ -77,12 +77,22 @@ def add_arguments_single(parser: ap.ArgumentParser) -> None:
             "Path to a TOML data configuration file to override the data paths in the loaded data module."
         ),
     )
+    parser.add_argument(
+        "--perturbation-npy",
+        type=str,
+        default=None,
+        help=(
+            "Optional path to a NumPy .npy/.npz file (or convertible CSV specification) that maps perturbation"
+            " names to explicit encoder vectors. When provided, these vectors override the default pert_onehot_map."
+        ),
+    )
 
 
 def run_tx_single(args: ap.ArgumentParser, *, phase_one_only: bool = False) -> None:
     import logging
     import os
     import sys
+    import re
 
     import anndata
     import lightning.pytorch as pl
@@ -172,6 +182,226 @@ def run_tx_single(args: ap.ArgumentParser, *, phase_one_only: bool = False) -> N
             if key in batch:
                 return key, ordered_candidates
         return None, ordered_candidates
+
+    def _ensure_tensor_vector(value, *, expected_dim=None, context="perturbation"):
+        if isinstance(value, torch.Tensor):
+            tensor = value.detach().clone().to(dtype=torch.float32, device="cpu")
+        else:
+            try:
+                tensor = torch.as_tensor(value, dtype=torch.float32)
+            except Exception as exc:
+                raise TypeError(f"Could not convert {context} value to tensor: {exc}") from exc
+        if tensor.ndim > 1:
+            tensor = tensor.reshape(-1)
+        if tensor.ndim != 1:
+            raise ValueError(
+                f"Expected a 1D tensor for {context}, but received shape {tuple(tensor.shape)}."
+            )
+        if expected_dim is not None and tensor.numel() != expected_dim:
+            raise ValueError(
+                f"Dimension mismatch for {context}: expected {expected_dim}, received {tensor.numel()}."
+            )
+        return tensor.contiguous()
+
+    def _normalize_pert_map(raw_map, *, expected_dim=None, label="perturbation map"):
+        if raw_map is None:
+            return {}
+        normalized = {}
+        for raw_key, raw_value in raw_map.items():
+            key = str(raw_key)
+            try:
+                tensor = _ensure_tensor_vector(
+                    raw_value,
+                    expected_dim=expected_dim,
+                    context=f"{label}:{key}",
+                )
+            except Exception as exc:
+                raise ValueError(f"Failed to normalize {label} entry '{key}': {exc}") from exc
+            normalized[key] = tensor
+        return normalized
+
+    def _infer_combination_csv(path):
+        directory, filename = os.path.split(path)
+        match = re.search(r"max[_-]?drugs[_-]?(\d+)", filename, flags=re.IGNORECASE)
+        if not match:
+            return None
+        suffix = match.group(1)
+        candidates = [
+            os.path.join(directory, f"average_to_genetic_reconstruction_maxdrugs{suffix}.csv"),
+            os.path.join(directory, f"average_to_genetic_reconstruction_maxdrugs{suffix}.CSV"),
+        ]
+        for candidate in candidates:
+            if os.path.exists(candidate):
+                return candidate
+        return None
+
+    def _parse_combination_spec(spec):
+        if spec is None:
+            return {}
+        if isinstance(spec, (float, np.floating)) and np.isnan(spec):
+            return {}
+        if not isinstance(spec, str):
+            spec = str(spec)
+        spec = spec.strip()
+        if not spec:
+            return {}
+        components = {}
+        for part in spec.split(";"):
+            piece = part.strip()
+            if not piece:
+                continue
+            if ":" not in piece:
+                raise ValueError(f"Invalid combination component '{piece}' (missing weight separator).")
+            combo_key, weight_str = piece.rsplit(":", 1)
+            combo_key = combo_key.strip()
+            if not combo_key:
+                raise ValueError(f"Invalid combination component '{piece}' (empty key).")
+            try:
+                weight = float(weight_str.strip())
+            except Exception as exc:
+                raise ValueError(f"Invalid weight value '{weight_str}' in component '{piece}': {exc}") from exc
+            components[combo_key] = components.get(combo_key, 0.0) + weight
+        return components
+
+    def _build_map_from_combination_table(csv_path, base_map, expected_dim):
+        if expected_dim is None:
+            raise ValueError(
+                "Cannot construct perturbation vectors from combination table without a known pert_dim."
+            )
+        if not base_map:
+            raise ValueError(
+                "Base perturbation map is empty; cannot expand combinations without reference encodings."
+            )
+        df = pd.read_csv(csv_path)
+        constructed = {}
+        missing_components = set()
+        zero_combo_genes = []
+        for row in df.itertuples(index=False):
+            gene_name = str(getattr(row, "gene"))
+            combo_spec = getattr(row, "combination", "")
+            components = _parse_combination_spec(combo_spec)
+            if not components:
+                zero_combo_genes.append(gene_name)
+                continue
+            vector = torch.zeros(expected_dim, dtype=torch.float32)
+            for combo_key, weight in components.items():
+                reference = base_map.get(combo_key)
+                if reference is None:
+                    missing_components.add(combo_key)
+                    continue
+                vector = vector + reference.to(dtype=torch.float32) * float(weight)
+            constructed[gene_name] = vector
+        if missing_components:
+            preview = ", ".join(sorted(missing_components)[:10])
+            raise KeyError(
+                "Encountered %d combination components that were not present in the base perturbation map. "
+                "Examples: %s" % (len(missing_components), preview)
+            )
+        if zero_combo_genes:
+            logger.warning(
+                "Skipped %d genes with empty combination specifications when building perturbation map from %s.",
+                len(zero_combo_genes),
+                csv_path,
+            )
+        logger.info(
+            "Constructed %d custom perturbation vectors from %s.",
+            len(constructed),
+            csv_path,
+        )
+        return constructed
+
+    def _serialize_pert_map_for_save(pert_map):
+        serialized = {}
+        for key, tensor in pert_map.items():
+            serialized[key] = tensor.detach().cpu().numpy()
+        return serialized
+
+    def _load_numpy_mapping(path):
+        loaded = np.load(path, allow_pickle=True)
+        if isinstance(loaded, np.lib.npyio.NpzFile):
+            return {k: loaded[k] for k in loaded.files}
+        if isinstance(loaded, np.ndarray):
+            if loaded.dtype == object:
+                if loaded.shape == ():
+                    return loaded.item()
+                mapping = {}
+                for entry in loaded.tolist():
+                    if isinstance(entry, (tuple, list)) and len(entry) == 2:
+                        mapping[str(entry[0])] = entry[1]
+                if mapping:
+                    return mapping
+            raise ValueError(
+                f"Unsupported array format when loading perturbation map from {path}."
+            )
+        if isinstance(loaded, dict):
+            return loaded
+        raise TypeError(f"Unsupported data type {type(loaded).__name__} in {path}.")
+
+    def _load_custom_perturbation_map(
+        path,
+        base_map,
+        expected_dim,
+    ):
+        if path is None:
+            return None, None
+
+        resolved_path = path
+        data = None
+        source_description = None
+        extension = os.path.splitext(resolved_path)[1].lower()
+
+        if os.path.exists(resolved_path) and extension in {".npy", ".npz"}:
+            data = _load_numpy_mapping(resolved_path)
+            source_description = resolved_path
+        elif os.path.exists(resolved_path) and extension == ".csv":
+            data = _build_map_from_combination_table(resolved_path, base_map, expected_dim)
+            source_description = resolved_path
+        else:
+            candidate_csv = _infer_combination_csv(resolved_path)
+            if candidate_csv and os.path.exists(candidate_csv):
+                data = _build_map_from_combination_table(candidate_csv, base_map, expected_dim)
+                source_description = candidate_csv
+                if extension in {".npy", ".npz"} or extension == "":
+                    try:
+                        serializable = _serialize_pert_map_for_save(data)
+                        if not os.path.exists(resolved_path):
+                            import tempfile
+                            with tempfile.NamedTemporaryFile(suffix=".npy", delete=False) as tmp_file:
+                                tmp_path = tmp_file.name
+                            try:
+                                np.save(tmp_path, serializable, allow_pickle=True)
+                                os.replace(tmp_path, resolved_path)
+                                logger.info("Saved converted perturbation map to %s", resolved_path)
+                            finally:
+                                if os.path.exists(tmp_path):
+                                    try:
+                                        os.remove(tmp_path)
+                                    except OSError:
+                                        pass
+                        else:
+                            logger.debug("Perturbation map already exists at %s; skipping save", resolved_path)
+                    except Exception as exc:
+                        logger.warning(
+                            "Failed to save converted perturbation map to %s: %s",
+                            resolved_path,
+                            exc,
+                        )
+            else:
+                raise FileNotFoundError(
+                    f"Custom perturbation specification {resolved_path} not found. "
+                    "Provide an existing .npy/.npz file or a CSV with combination specifications."
+                )
+
+        if isinstance(data, dict):
+            normalized = _normalize_pert_map(
+                data,
+                expected_dim=expected_dim,
+                label="custom perturbation map",
+            )
+        else:
+            normalized = data
+
+        return normalized, source_description
 
     torch.multiprocessing.set_sharing_strategy("file_system")
 
@@ -543,24 +773,87 @@ def run_tx_single(args: ap.ArgumentParser, *, phase_one_only: bool = False) -> N
     else:
         control_pert = data_module.get_control_pert()
     
-    # Load pert_onehot_map early to get perturbations without loading data
-    pert_onehot_map = getattr(data_module, "pert_onehot_map", None)
-    if pert_onehot_map is None:
+    custom_perturbation_path = getattr(args, "perturbation_npy", None)
+
+    base_perturbation_map_raw = getattr(data_module, "pert_onehot_map", None)
+    if base_perturbation_map_raw is None:
         map_path = os.path.join(run_output_dir, "pert_onehot_map.pt")
         if os.path.exists(map_path):
-            pert_onehot_map = torch.load(map_path, weights_only=False)
-            logger.info("Loaded pert_onehot_map from %s", map_path)
+            base_perturbation_map_raw = torch.load(map_path, weights_only=False)
+            logger.info("Loaded base pert_onehot_map from %s", map_path)
         else:
             logger.warning("pert_onehot_map.pt not found at %s", map_path)
-            pert_onehot_map = {}
-    
+            base_perturbation_map_raw = {}
+
+    base_perturbation_map = _normalize_pert_map(
+        base_perturbation_map_raw,
+        label="base perturbation map",
+    )
+    if base_perturbation_map:
+        logger.info("Base perturbation map contains %d entries.", len(base_perturbation_map))
+    else:
+        logger.warning("Base perturbation map is empty; custom perturbations may be required.")
+
+    base_expected_dim = None
+    if base_perturbation_map:
+        base_expected_dim = next(iter(base_perturbation_map.values())).numel()
+
+    expected_pert_dim = base_expected_dim
+    var_dims_preview = None
+    if custom_perturbation_path or base_expected_dim is None:
+        try:
+            var_dims_preview = data_module.get_var_dims()
+        except Exception as exc:
+            logger.debug("Unable to preview var_dims prior to perturbation setup: %s", exc)
+            var_dims_preview = None
+        else:
+            if isinstance(var_dims_preview, dict) and var_dims_preview.get("pert_dim") is not None:
+                expected_pert_dim = var_dims_preview["pert_dim"]
+
+    custom_perturbation_map = {}
+    custom_map_source = None
+    if custom_perturbation_path:
+        logger.info("Attempting to load custom perturbation vectors from %s", custom_perturbation_path)
+        custom_perturbation_map, custom_map_source = _load_custom_perturbation_map(
+            custom_perturbation_path,
+            base_perturbation_map,
+            expected_pert_dim,
+        )
+        if not custom_perturbation_map:
+            raise ValueError(
+                f"No perturbation vectors were loaded from {custom_map_source or custom_perturbation_path}."
+            )
+        expected_pert_dim = next(iter(custom_perturbation_map.values())).numel()
+        if control_pert and control_pert not in custom_perturbation_map:
+            base_control = base_perturbation_map.get(control_pert)
+            if base_control is not None:
+                custom_perturbation_map[control_pert] = base_control.clone()
+                logger.info(
+                    "Added control perturbation '%s' to custom perturbation map using base encoding.",
+                    control_pert,
+                )
+        logger.info(
+            "Using custom perturbation map with %d entries (source: %s).",
+            len(custom_perturbation_map),
+            custom_map_source or custom_perturbation_path,
+        )
+
+    if custom_perturbation_map:
+        pert_onehot_map = custom_perturbation_map
+        fallback_perturbation_map = base_perturbation_map
+    else:
+        pert_onehot_map = base_perturbation_map
+        fallback_perturbation_map = None
+
     # Use pert_onehot_map to get all perturbations if available, otherwise enumerate from dataloader
     if pert_onehot_map:
-        # Use pert_onehot_map to get all perturbations (preferred approach)
         unique_perts = list(pert_onehot_map.keys())
-        logger.info("Enumerating %d perturbations from pert_onehot_map", len(unique_perts))
+        logger.info(
+            "Enumerating %d perturbations from %s perturbation map",
+            len(unique_perts),
+            "custom" if custom_perturbation_map else "base",
+        )
     else:
-        # Fallback: enumerate from dataloader (may be limited by cell type filtering)
         unique_perts = []
         seen_perts = set()
         for batch in eval_loader:
@@ -575,8 +868,8 @@ def run_tx_single(args: ap.ArgumentParser, *, phase_one_only: bool = False) -> N
         logger.warning(
             "Using perturbations from filtered dataloader (%d found). "
             "This may be limited by --target-cell-type filtering. "
-            "Consider using pert_onehot_map for complete perturbation coverage.",
-            len(unique_perts)
+            "Consider supplying a perturbation map for complete perturbation coverage.",
+            len(unique_perts),
         )
 
     target_core_n_default = 64
@@ -822,13 +1115,20 @@ def run_tx_single(args: ap.ArgumentParser, *, phase_one_only: bool = False) -> N
 
     # pert_onehot_map was already loaded earlier for perturbation enumeration
     if not pert_onehot_map:
-        logger.warning("No pert_onehot_map available; will use zero embeddings for perturbations")
+        logger.warning("No perturbation map available; will use zero embeddings for perturbations")
         pert_onehot_map = {}
 
     def _prepare_pert_emb(pert_name, length):
         vec = pert_onehot_map.get(pert_name)
-        if vec is None and control_pert in pert_onehot_map:
-            vec = pert_onehot_map[control_pert]
+        if vec is None and fallback_perturbation_map:
+            vec = fallback_perturbation_map.get(pert_name)
+            if vec is not None:
+                logger.debug("Using fallback perturbation vector for %s from base map.", pert_name)
+        if vec is None and control_pert:
+            if control_pert in pert_onehot_map:
+                vec = pert_onehot_map[control_pert]
+            elif fallback_perturbation_map and control_pert in fallback_perturbation_map:
+                vec = fallback_perturbation_map[control_pert]
         
         pert_dim = getattr(model, "pert_dim", var_dims.get("pert_dim", 0))
         if pert_dim <= 0:
@@ -839,6 +1139,7 @@ def run_tx_single(args: ap.ArgumentParser, *, phase_one_only: bool = False) -> N
             vec = torch.zeros(pert_dim)
             logger.debug("Created zero perturbation vector for %s (not found in pert_onehot_map)", pert_name)
         else:
+            vec = vec.clone().detach().cpu()
             # Handle dimension mismatch between pert_onehot_map and model's pert_dim
             if vec.shape[0] != pert_dim:
                 if vec.shape[0] > pert_dim:
@@ -1058,4 +1359,3 @@ def run_tx_single(args: ap.ArgumentParser, *, phase_one_only: bool = False) -> N
 def save_core_cells_real_preds(args: ap.ArgumentParser) -> None:
     """Run only phase one of the pipeline and persist real core-cell embeddings per perturbation."""
     return run_tx_single(args, phase_one_only=True)
-
