@@ -3,6 +3,7 @@ from __future__ import annotations
 import logging
 from typing import Optional, Union
 
+import types
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -142,7 +143,7 @@ def get_transformer_backbone(key, kwargs) -> PreTrainedModel:
         model.embed_tokens.weight.zero_()
     elif key.lower() in {"deepseek", "deepseek_moe"}:
         config = DeepseekV3Config(**kwargs)
-        model = DeepseekBidirectionalModel(config)
+        model = DeepseekV3BidirectionalModel(config)
         model_dim = config.hidden_size
     else:
         raise ValueError(f"Unknown backbone key {key}")
@@ -405,7 +406,7 @@ class GPT2BidirectionalModel(GPT2Model):
             **kwargs,
         )
 
-class DeepseekBidirectionalModel(DeepseekV3Model):
+class DeepseekV3BidirectionalModel(DeepseekV3Model):
     """
     A drop-in replacement for DeepseekV3Model with bidirectional attention.
     By overriding _update_causal_mask to return None, all tokens attend to each other.
@@ -425,11 +426,57 @@ class DeepseekBidirectionalModel(DeepseekV3Model):
                 layer.self_attn.is_causal = False
 
         self.config.num_experts_per_tok = 1
-        self.config.n_routed_experts = 8 # num datasets to train on
-        self.config.n_shared_experts = 1
+        self.config.n_routed_experts = 1 # num datasets to train on
+        # self.config.n_shared_experts = 1
+        self._patch_moe_route()
 
+    def _patch_moe_route(self):
+        """
+        Wrap DeepseekV3MoE.route_tokens_to_experts so it first checks for
+        `self._forced_expert_ids` (set per forward call), otherwise falls back
+        to the original router.
+        """
+        def make_wrapped_route(orig_fn):
+            def wrapped(self_moe, router_logits):
+                forced = getattr(self_moe, "_forced_expert_ids", None)
+                if forced is None:
+                    # normal behavior
+                    return orig_fn(router_logits)
 
-    
+                # forced is expected to be shape (B*S,) with expert ids
+                device = router_logits.device
+                top_k = self_moe.top_k  # we set num_experts_per_tok=1; still works if >1
+
+                if forced.dim() != 1:
+                    raise ValueError("Expected _forced_expert_ids as 1D (B*S,) LongTensor")
+
+                if forced.numel() != router_logits.size(0):
+                    raise ValueError(
+                        f"Size mismatch: forced {forced.numel()} vs router_logits {router_logits.size(0)}"
+                    )
+
+                forced = forced.to(device=device, dtype=torch.long)
+
+                # Build (B*S, top_k) indices/weights; all mass to the first slot
+                topk_indices = forced.unsqueeze(1).repeat(1, top_k)
+                topk_weights = router_logits.new_zeros((forced.size(0), top_k))
+                # Note: routed_scaling_factor is applied in original code after norm;
+                # here we mimic: put all weight on first slot * scaling factor
+                topk_weights[:, 0] = 1.0 * self_moe.routed_scaling_factor
+                return topk_indices, topk_weights
+            return wrapped
+
+        # locate all MoE blocks and wrap their route function
+        for layer in self.layers:
+            mlp = getattr(layer, "mlp", None)
+            if mlp is None or not hasattr(mlp, "route_tokens_to_experts"):
+                continue
+            if not hasattr(mlp, "_orig_route_tokens_to_experts"):
+                mlp._orig_route_tokens_to_experts = mlp.route_tokens_to_experts
+                mlp.route_tokens_to_experts = types.MethodType(
+                    make_wrapped_route(mlp._orig_route_tokens_to_experts), mlp
+                )
+
     def _update_causal_mask(
         self,
         attention_mask: torch.Tensor,
@@ -451,16 +498,44 @@ class DeepseekBidirectionalModel(DeepseekV3Model):
         output_attentions: bool = None,
         output_hidden_states: bool = None,
         cache_position: torch.LongTensor = None,
-        **flash_attn_kwargs,
+        moe_expert_indices: torch.LongTensor | None = None,  # <-- (B,) or (B,S) or (B*S,)
+        **kwargs,
     ):
-        flash_attn_kwargs["is_causal"] = False
+        # ensure attention impls know we're non-causal
+        kwargs["is_causal"] = False
+
+        # make a dense 1s mask if none provided (bidirectional)
         if attention_mask is None:
-            B = None
-            S = None
             if inputs_embeds is not None:
                 B, S = inputs_embeds.size(0), inputs_embeds.size(1)
-            if B and S:
-                attention_mask = torch.ones((B, 1, S, S), dtype=torch.float, device=inputs_embeds.device)
+            elif input_ids is not None:
+                B, S = input_ids.size(0), input_ids.size(1)
+            else:
+                B = S = None
+            if B is not None and S is not None:
+                device = inputs_embeds.device if inputs_embeds is not None else input_ids.device
+                attention_mask = torch.ones((B, 1, S, S), dtype=torch.float, device=device)
+
+        # ------- Prepare forced routing vector (B*S,) if provided -------
+        # Assumes moe_expert_indices is a 1D tensor of shape (B,) with per-sample expert IDs
+        forced_flat = None
+        if moe_expert_indices is not None:
+            if inputs_embeds is not None:
+                B, S = inputs_embeds.size(0), inputs_embeds.size(1)
+                dev = inputs_embeds.device
+            else:
+                B, S = input_ids.size(0), input_ids.size(1)
+                dev = input_ids.device
+
+            # Expand per-sample expert ID across sequence dimension: (B,) -> (B, S) -> (B*S,)
+            forced_flat = moe_expert_indices[:, None].expand(B, S).reshape(-1).to(dev, dtype=torch.long)
+
+        if forced_flat is not None:
+            for layer in self.layers:
+                mlp = getattr(layer, "mlp", None)
+                if mlp is not None and hasattr(mlp, "route_tokens_to_experts"):
+                    # Give this forward call its forced routing vector
+                    mlp._forced_expert_ids = forced_flat
 
         return super().forward(
             input_ids=input_ids,
@@ -472,8 +547,11 @@ class DeepseekBidirectionalModel(DeepseekV3Model):
             output_attentions=output_attentions,
             output_hidden_states=output_hidden_states,
             cache_position=cache_position,
-            **flash_attn_kwargs,
+            **kwargs,  
         )
-    
-
-    
+        #
+        #     # clear the per-call attribute so training/inference elsewhere is unaffected
+        #     for layer in self.layers:
+        #         mlp = getattr(layer, "mlp", None)
+        #         if mlp is not None and hasattr(mlp, "_forced_expert_ids"):
+        #             delattr(mlp, "_forced_expert_ids")

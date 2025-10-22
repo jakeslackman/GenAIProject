@@ -159,11 +159,8 @@ class StateTransitionPerturbationModel(PerturbationModel):
         self.detach_decoder = kwargs.get("detach_decoder", False)
 
         self.transformer_backbone_key = transformer_backbone_key
-        self.transformer_backbone_kwargs = dict(transformer_backbone_kwargs or {})
-        max_positions = self.cell_sentence_len + kwargs.get("extra_tokens", 0)
-        self.transformer_backbone_kwargs.setdefault("n_positions", max_positions)
-        self.transformer_backbone_kwargs.setdefault("max_position_embeddings", max_positions)
-        self.uses_manual_expert_routing = self.transformer_backbone_key.lower() in {"deepseek", "deepseek_moe"}
+        self.transformer_backbone_kwargs = transformer_backbone_kwargs
+        self.transformer_backbone_kwargs["n_positions"] = self.cell_sentence_len + kwargs.get("extra_tokens", 0)
 
         self.distributional_loss = distributional_loss
         self.gene_dim = gene_dim
@@ -339,18 +336,11 @@ class StateTransitionPerturbationModel(PerturbationModel):
 
         # Optionally wrap backbone with LoRA adapters
         if lora_cfg and lora_cfg.get("enable", False):
-            supported_lora = self.transformer_backbone_key.lower() in {"gpt2", "llama"}
-            if not supported_lora:
-                logger.warning(
-                    "LoRA adapters are not supported for backbone '%s'; skipping LoRA application.",
-                    self.transformer_backbone_key,
-                )
-            else:
-                self.transformer_backbone = apply_lora(
-                    self.transformer_backbone,
-                    self.transformer_backbone_key,
-                    lora_cfg,
-                )
+            self.transformer_backbone = apply_lora(
+                self.transformer_backbone,
+                self.transformer_backbone_key,
+                lora_cfg,
+            )
 
         # Project from input_dim to hidden_dim for transformer input
         # self.project_to_hidden = nn.Linear(self.input_dim, self.hidden_dim)
@@ -399,6 +389,8 @@ class StateTransitionPerturbationModel(PerturbationModel):
             # we are inferencing on a single batch, so accept variable length sentences
             pert = batch["pert_emb"].reshape(1, -1, self.pert_dim)
             basal = batch["ctrl_cell_emb"].reshape(1, -1, self.input_dim)
+        
+        batch["moe_expert_indices"] = torch.tensor([0] * pert.shape[0])
 
         # Shape: [B, S, input_dim]
         pert_embedding = self.encode_perturbation(pert)
@@ -437,30 +429,6 @@ class StateTransitionPerturbationModel(PerturbationModel):
             # Append confidence token: [B, S, E] -> [B, S+1, E] (might be one more if we have the batch token)
             seq_input = self.confidence_token.append_confidence_token(seq_input)
 
-        # forward pass + extract CLS last hidden state
-        backbone_kwargs = {}
-        if self.uses_manual_expert_routing:
-            manual_routing = batch.get("expert_index")
-            if manual_routing is None:
-                manual_routing = batch.get("expert_indices")
-            if manual_routing is None:
-                manual_routing = batch.get("expert_weights")
-            if manual_routing is None:
-                manual_routing = batch.get("expert_assignment")
-            if manual_routing is not None:
-                if not isinstance(manual_routing, torch.Tensor):
-                    manual_routing = torch.as_tensor(manual_routing, device=seq_input.device)
-                else:
-                    manual_routing = manual_routing.to(seq_input.device)
-
-                batch_size = seq_input.size(0)
-                if manual_routing.dim() == 0:
-                    manual_routing = manual_routing.expand(batch_size)
-                elif manual_routing.size(0) != batch_size:
-                    manual_routing = manual_routing.reshape(batch_size, *manual_routing.shape[1:])
-
-                backbone_kwargs["expert_index"] = manual_routing
-
         if self.hparams.get("mask_attn", False):
             batch_size, seq_length, _ = seq_input.shape
             device = seq_input.device
@@ -475,13 +443,14 @@ class StateTransitionPerturbationModel(PerturbationModel):
             # repeat out to [B,H,S,S]
             attn_mask = base.repeat(batch_size, num_heads, 1, 1)
 
-            if self.uses_manual_expert_routing:
-                outputs = self.transformer_backbone(inputs_embeds=seq_input, **backbone_kwargs)
-            else:
-                outputs = self.transformer_backbone(inputs_embeds=seq_input, attention_mask=attn_mask)
+            
+            outputs = self.transformer_backbone(inputs_embeds=seq_input, attention_mask=attn_mask)
+            transformer_output = outputs.last_hidden_state
+        elif self.transformer_backbone_key == "moe":
+            outputs = self.transformer_backbone(inputs_embeds=seq_input, moe_expert_indices=batch["moe_expert_indices"])
             transformer_output = outputs.last_hidden_state
         else:
-            outputs = self.transformer_backbone(inputs_embeds=seq_input, **backbone_kwargs)
+            outputs = self.transformer_backbone(inputs_embeds=seq_input)
             transformer_output = outputs.last_hidden_state
 
         # Extract outputs accounting for optional prepended batch token and optional confidence token at the end
