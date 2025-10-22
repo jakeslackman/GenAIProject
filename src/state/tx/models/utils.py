@@ -141,7 +141,7 @@ def get_transformer_backbone(key, kwargs) -> PreTrainedModel:
 
         model.embed_tokens.weight.requires_grad = False
         model.embed_tokens.weight.zero_()
-    elif key.lower() in {"deepseek", "deepseek_moe"}:
+    elif key.lower() in {"deepseek", "deepseek_moe", "moe", "deepseek_v3"}:
         config = DeepseekV3Config(**kwargs)
         model = DeepseekV3BidirectionalModel(config)
         model_dim = config.hidden_size
