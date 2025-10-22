@@ -73,11 +73,11 @@ def run_tx_train(cfg: DictConfig):
             else:
                 sentence_len = 1
         else:
-            transformer_kwargs = cfg["model"]["kwargs"].get("transformer_backbone_kwargs", {})
-            sentence_len = transformer_kwargs.get("n_positions") or transformer_kwargs.get("max_position_embeddings")
-            if sentence_len is None:
-                # Fall back to model kwargs for backbones that manage positional limits internally (e.g., Deepseek MoE).
-                sentence_len = cfg["model"]["kwargs"].get("cell_sentence_len", 1)
+            try:
+                sentence_len = cfg["model"]["kwargs"]["transformer_backbone_kwargs"]["n_positions"]
+            except:
+                sentence_len = cfg["model"]["kwargs"]["transformer_backbone_kwargs"]["max_position_embeddings"]
+
     if cfg["model"]["name"].lower().startswith("scgpt"):  # scGPT uses log-normalized expression
         cfg["data"]["kwargs"]["transform"] = "log-normalize"
         cfg["data"]["kwargs"]["hvg_names_uns_key"] = (
