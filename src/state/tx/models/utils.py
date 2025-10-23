@@ -426,8 +426,8 @@ class DeepseekV3BidirectionalModel(DeepseekV3Model):
                 layer.self_attn.is_causal = False
 
         self.config.num_experts_per_tok = 1
-        self.config.n_routed_experts = 1 # num datasets to train on
-        # self.config.n_shared_experts = 1
+        self.config.n_routed_experts = 5 # num datasets to train on
+        self.config.n_shared_experts = 1
         self._patch_moe_route()
 
     def _patch_moe_route(self):

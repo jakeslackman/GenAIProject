@@ -389,8 +389,34 @@ class StateTransitionPerturbationModel(PerturbationModel):
             # we are inferencing on a single batch, so accept variable length sentences
             pert = batch["pert_emb"].reshape(1, -1, self.pert_dim)
             basal = batch["ctrl_cell_emb"].reshape(1, -1, self.input_dim)
+
+        dataset_name = batch["dataset"]
         
-        batch["moe_expert_indices"] = torch.tensor([0] * pert.shape[0])
+        # Define dataset to expert mapping
+        dataset_to_expert = {
+            "replogle": 0,
+            "jiang": 1,
+            "mcfaline": 2,
+            "parse": 3,
+            "srivatsan": 4,
+            "tahoe": 1,  # fallback for tahoe, adjust as needed
+        }
+        
+        # Normalize dataset name (lowercase)
+        dataset_lower = dataset_name.lower()
+        
+        # Find matching dataset key
+        expert_idx = None
+        for key, idx in dataset_to_expert.items():
+            if key in dataset_lower:
+                expert_idx = idx
+                break
+        
+        if expert_idx is None:
+            raise ValueError(f"Unknown dataset: {dataset_name}. Available: {list(dataset_to_expert.keys())}")
+        
+        # All samples in the batch go to the same expert
+        batch["moe_expert_indices"] = torch.tensor([expert_idx] * pert.shape[0], device=pert.device)
 
         # Shape: [B, S, input_dim]
         pert_embedding = self.encode_perturbation(pert)
