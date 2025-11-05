@@ -19,5 +19,6 @@ kwargs:
   store_raw_basal: false
   int_counts: false
   barcode: true
+  store_raw_expression: false
 output_dir: null
 debug: true

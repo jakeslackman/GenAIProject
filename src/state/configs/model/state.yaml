@@ -20,6 +20,8 @@ kwargs:
   use_batch_token: False
   nb_decoder: False
   mask_attn: False
+  discrete: False
+  gene_bins_file: null
 
   # --- Dose handling ---
   dosage: False

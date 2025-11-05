@@ -15,6 +15,7 @@ from .base import PerturbationModel
 from .decoders import FinetuneVCICountsDecoder
 from .decoders_nb import NBDecoder, nb_nll
 from .utils import build_mlp, get_activation_class, get_transformer_backbone, apply_lora
+from .gene_binning import compute_bin_indices, load_gene_bins
 
 
 logger = logging.getLogger(__name__)
@@ -188,6 +189,75 @@ class StateTransitionPerturbationModel(PerturbationModel):
         self.mmd_num_chunks = max(int(kwargs.get("mmd_num_chunks", 1)), 1)
         self.randomize_mmd_chunks = bool(kwargs.get("randomize_mmd_chunks", False))
 
+        # Align discrete gene-space operations with the HVG representation when available.
+        if self.embed_key == "X_hvg" and self.output_space != "all":
+            if self.hvg_dim is None:
+                raise ValueError(
+                    "embed_key='X_hvg' requires hvg_dim from the data module when output_space != 'all'."
+                )
+            if self.gene_dim != self.hvg_dim:
+                logger.info(
+                    "embed_key='X_hvg' detected; overriding gene_dim=%s with hvg_dim=%s for discrete outputs",
+                    self.gene_dim,
+                    self.hvg_dim,
+                )
+            self.gene_dim = self.hvg_dim
+            try:
+                self.hparams["gene_dim"] = self.hvg_dim  # type: ignore[index]
+            except Exception:
+                pass
+
+        self.use_discrete_bins: bool = bool(kwargs.get("discrete", False))
+        self.num_bins: int = int(kwargs.get("num_bins", 0))
+        self.total_bins: int = self.num_bins + 1 if self.num_bins >= 0 else 0
+        self.bin_loss_weight: float = float(kwargs.get("bin_loss_weight", 1.0))
+        self.bin_zero_threshold: float = float(kwargs.get("bin_zero_threshold", 1e-5))
+        gene_bins_file = kwargs.get("gene_bins_file")
+        self._bin_logits: Optional[torch.Tensor] = None
+        if self.use_discrete_bins:
+            if self.gene_dim is None:
+                raise ValueError("Discrete binning requires gene_dim to be defined in the data module")
+            if not gene_bins_file:
+                raise ValueError("model.kwargs.gene_bins_file must be provided when discrete=True")
+            gene_bins = load_gene_bins(gene_bins_file)
+            if self.gene_dim is not None and self.gene_dim != gene_bins.num_genes:
+                logger.info(
+                    "Overriding gene_dim=%s with gene_bins.num_genes=%s for discrete head",
+                    self.gene_dim,
+                    gene_bins.num_genes,
+                )
+            self.gene_dim = gene_bins.num_genes
+            try:
+                if hasattr(self, "hparams"):
+                    self.hparams["gene_dim"] = self.gene_dim  # type: ignore[index]
+            except Exception:
+                pass
+            file_total_bins = gene_bins.num_bins
+            file_positive_bins = file_total_bins - 1
+            if self.num_bins > 0 and self.num_bins != file_positive_bins:
+                raise ValueError(
+                    "Mismatch between requested model.kwargs.num_bins="
+                    f"{self.num_bins} and bins encoded in {gene_bins_file} ({file_positive_bins})."
+                )
+            if self.num_bins <= 0:
+                self.num_bins = file_positive_bins
+            self.total_bins = self.num_bins + 1
+            if self.total_bins != file_total_bins:
+                raise ValueError(
+                    f"Expected {file_total_bins} total bins from {gene_bins_file}, got {self.total_bins}."
+                )
+            self.register_buffer("bin_pos_ends", gene_bins.pos_ends)
+            self.register_buffer("bin_medians", gene_bins.medians)
+            self.register_buffer("bin_modes", gene_bins.modes)
+            self.register_buffer("bin_valid", gene_bins.valid)
+            self.bin_classifier = nn.Linear(self.hidden_dim, self.gene_dim * self.total_bins)
+        else:
+            self.register_buffer("bin_pos_ends", torch.empty(0), persistent=False)
+            self.register_buffer("bin_medians", torch.empty(0), persistent=False)
+            self.register_buffer("bin_modes", torch.empty(0), persistent=False)
+            self.register_buffer("bin_valid", torch.empty(0, dtype=torch.bool), persistent=False)
+            self.bin_classifier = None
+
         # Build the distributional loss from geomloss
         blur = kwargs.get("blur", 0.05)
         loss_name = kwargs.get("loss", "energy")
@@ -258,8 +328,8 @@ class StateTransitionPerturbationModel(PerturbationModel):
         # Internal cache for last token features (B, S, H) from transformer for aux loss
         self._token_features: Optional[torch.Tensor] = None
 
-        # if the model is outputting to counts space, apply relu
-        # otherwise its in embedding space and we don't want to
+        # Default activation keeps embeddings unchanged; swap to ReLU when producing counts
+        self.relu: nn.Module = torch.nn.Identity()
         is_gene_space = kwargs["embed_key"] == "X_hvg" or kwargs["embed_key"] is None
         if is_gene_space or self.gene_decoder is None:
             self.relu = torch.nn.ReLU()
@@ -382,6 +452,20 @@ class StateTransitionPerturbationModel(PerturbationModel):
             self.gene_decoder = FinetuneVCICountsDecoder(
                 genes=gene_names,
             )
+
+        if self.use_discrete_bins:
+            if self.gene_decoder is not None:
+                logger.info("Discrete binning enabled; disabling continuous gene decoder head")
+            self.gene_decoder = None
+            self.decoder_cfg = None
+            self.gene_decoder_bool = False
+            try:
+                if hasattr(self, "hparams"):
+                    self.hparams["gene_decoder_bool"] = False  # type: ignore[index]
+                    self.hparams["decoder_cfg"] = None  # type: ignore[index]
+            except Exception:
+                pass
+
         print(self)
 
     def _build_networks(self, lora_cfg=None):
@@ -463,6 +547,7 @@ class StateTransitionPerturbationModel(PerturbationModel):
         The `padded` argument here is set to True if the batch is padded. Otherwise, we
         expect a single batch, so that sentences can vary in length across batches.
         """
+        self._bin_logits = None
         if padded:
             pert = batch["pert_emb"].reshape(-1, self.cell_sentence_len, self.pert_dim)
             basal = batch["ctrl_cell_emb"].reshape(-1, self.cell_sentence_len, self.input_dim)
@@ -578,6 +663,19 @@ class StateTransitionPerturbationModel(PerturbationModel):
             res_pred = res_pred * self.hill_gate(logd_norm)            # [B,S,H]×[B,S,H]
         # Cache token features for auxiliary batch prediction loss (B, S, H)
         self._token_features = res_pred
+
+        if self.use_discrete_bins and self.bin_classifier is not None:
+            bin_logits = self.bin_classifier(res_pred)
+            B, S, _ = res_pred.shape
+            try:
+                bin_logits = bin_logits.view(B, S, self.gene_dim, self.total_bins)
+            except RuntimeError as exc:
+                raise RuntimeError(
+                    f"Unable to reshape bin logits to [B={B}, S={S}, G={self.gene_dim}, K={self.total_bins}]"
+                ) from exc
+            self._bin_logits = bin_logits
+        else:
+            self._bin_logits = None
 
         # add to basal if predicting residual
         if self.predict_residual and self.output_space == "all":
@@ -776,6 +874,54 @@ class StateTransitionPerturbationModel(PerturbationModel):
 
         return self.loss_fn(pred, target)
 
+    def _compute_bin_cross_entropy(
+        self,
+        batch: Dict[str, torch.Tensor],
+        bin_logits: Optional[torch.Tensor],
+        padded: bool,
+    ) -> Optional[torch.Tensor]:
+        """Compute auxiliary cross entropy loss for discrete gene bins."""
+
+        if not self.use_discrete_bins:
+            return None
+        if bin_logits is None:
+            return None
+        counts = batch.get("pert_cell_counts")
+        if counts is None:
+            raise RuntimeError(
+                "Discrete binning requires 'pert_cell_counts' in the batch. "
+                "Enable raw-expression export in the data module when model.kwargs.discrete=True."
+            )
+
+        if self.gene_dim is None:
+            raise ValueError("gene_dim must be set to compute discrete bin loss")
+
+        if padded:
+            counts = counts.reshape(-1, self.cell_sentence_len, self.gene_dim)
+        else:
+            counts = counts.reshape(1, -1, self.gene_dim)
+
+        counts = counts.to(bin_logits.device, dtype=torch.float32)
+        counts_flat = counts.reshape(-1, self.gene_dim)
+
+        with torch.no_grad():
+            target_bins = compute_bin_indices(
+                counts_flat,
+                self.bin_pos_ends,
+                self.bin_valid,
+                self.bin_zero_threshold,
+            ).reshape_as(counts)
+
+        logits_flat = bin_logits.reshape(-1, self.total_bins)
+        targets_flat = target_bins.reshape(-1).long()
+
+        if logits_flat.shape[0] != targets_flat.shape[0]:
+            raise RuntimeError(
+                f"Mismatch between logits ({logits_flat.shape[0]}) and targets ({targets_flat.shape[0]}) for bin CE"
+            )
+
+        return F.cross_entropy(logits_flat, targets_flat, reduction="mean")
+
     def training_step(self, batch: Dict[str, torch.Tensor], batch_idx: int, padded=True) -> torch.Tensor:
         """Training step logic for both main model and decoder."""
         # Get model predictions (in latent space)
@@ -892,6 +1038,12 @@ class StateTransitionPerturbationModel(PerturbationModel):
 
             total_loss = total_loss + self.decoder_loss_weight * decoder_loss
 
+        if self.use_discrete_bins:
+            bin_loss = self._compute_bin_cross_entropy(batch, self._bin_logits, padded=padded)
+            if bin_loss is not None:
+                self.log("train/bin_ce_loss", bin_loss, prog_bar=True)
+                total_loss = total_loss + self.bin_loss_weight * bin_loss
+
         if confidence_pred is not None:
             confidence_pred_vals = confidence_pred
             if confidence_pred_vals.dim() > 1:
@@ -974,6 +1126,12 @@ class StateTransitionPerturbationModel(PerturbationModel):
             self.log("val/decoder_loss", decoder_loss)
             loss = loss + self.decoder_loss_weight * decoder_loss
 
+        if self.use_discrete_bins:
+            bin_loss = self._compute_bin_cross_entropy(batch, self._bin_logits, padded=True)
+            if bin_loss is not None:
+                self.log("val/bin_ce_loss", bin_loss, prog_bar=True)
+                loss = loss + self.bin_loss_weight * bin_loss
+
         if confidence_pred is not None:
             confidence_pred_vals = confidence_pred
             if confidence_pred_vals.dim() > 1:
@@ -1020,6 +1178,11 @@ class StateTransitionPerturbationModel(PerturbationModel):
             confidence_loss = self.confidence_weight * self.confidence_loss_fn(confidence_pred_vals, confidence_targets)
             self.log("test/confidence_loss", confidence_loss)
 
+        if self.use_discrete_bins:
+            bin_loss = self._compute_bin_cross_entropy(batch, self._bin_logits, padded=False)
+            if bin_loss is not None:
+                self.log("test/bin_ce_loss", bin_loss)
+
     def predict_step(self, batch, batch_idx, padded=True, **kwargs):
         """
         Typically used for final inference. We'll replicate old logic:s
@@ -1055,5 +1218,19 @@ class StateTransitionPerturbationModel(PerturbationModel):
                 pert_cell_counts_preds = self.gene_decoder(latent_output)
 
             output_dict["pert_cell_counts_preds"] = pert_cell_counts_preds
+        elif self.use_discrete_bins and self._bin_logits is not None:
+            if padded:
+                bin_logits = self._bin_logits.reshape(-1, self.cell_sentence_len, self.gene_dim, self.total_bins)
+            else:
+                bin_logits = self._bin_logits.reshape(1, -1, self.gene_dim, self.total_bins)
+
+            bin_preds = bin_logits.argmax(dim=-1)
+            medians = self.bin_medians.to(bin_logits.device)
+            median_lookup = medians.view(1, 1, self.gene_dim, self.total_bins)
+            counts_pred = torch.take_along_dim(median_lookup, bin_preds.unsqueeze(-1), dim=-1).squeeze(-1)
+
+            output_dict["bin_logits"] = bin_logits
+            output_dict["bin_preds"] = bin_preds
+            output_dict["pert_cell_counts_preds"] = counts_pred.reshape(-1, self.gene_dim)
 
         return output_dict

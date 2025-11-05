@@ -113,6 +113,9 @@ def run_tx_train(cfg: DictConfig):
         f"data.kwargs.output_space must be one of 'embedding', 'gene', or 'all'; got {output_space!r}"
     )
 
+    if cfg["model"]["kwargs"].get("discrete", False):
+        cfg["data"]["kwargs"]["store_raw_expression"] = True
+
     data_module: PerturbationDataModule = get_datamodule(
         cfg["data"]["name"],
         cfg["data"]["kwargs"],
