@@ -2,7 +2,8 @@ from typing import Union
 
 import torch
 import torch.nn as nn
-from transformers import GPT2Config, GPT2Model, LlamaConfig, LlamaModel, PreTrainedModel, LlamaAttention
+from transformers import GPT2Config, GPT2Model, LlamaConfig, LlamaModel, PreTrainedModel
+from transformers.models.llama.modeling_llama import LlamaAttention
 
 # LoRA / PEFT
 try:
