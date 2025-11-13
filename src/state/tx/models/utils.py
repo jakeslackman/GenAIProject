@@ -243,15 +243,14 @@ class LlamaAttentionWithQKNorm(LlamaAttention):
     def forward(
         self,
         hidden_states: torch.Tensor,
-        attention_mask: torch.Tensor | None = None,
-        position_ids: torch.LongTensor | None = None,
-        past_key_value: torch.Tensor | None = None,
-        output_attentions: bool = False,
-        use_cache: bool = False,
-        cache_position: torch.LongTensor | None = None,
+        *,
         position_embeddings: tuple[torch.Tensor, torch.Tensor] | None = None,
+        attention_mask: torch.Tensor | None = None,
+        past_key_values: torch.Tensor | None = None,
+        cache_position: torch.LongTensor | None = None,
+        output_attentions: bool = False,
         **kwargs,
-    ) -> tuple[torch.Tensor, torch.Tensor | None, tuple[torch.Tensor, ...] | None]:
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
         """
         Forward pass with QK normalization.
         Normalizes Q and K vectors (L2 normalization) before computing attention scores.
@@ -291,10 +290,10 @@ class LlamaAttentionWithQKNorm(LlamaAttention):
         key_states = key_states / (key_norm + eps)
 
         # Handle past_key_value for caching (same as parent)
-        if past_key_value is not None:
+        if past_key_values is not None:
             cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}
             layer_idx = getattr(self, 'layer_idx', None)
-            key_states, value_states = past_key_value.update(key_states, value_states, layer_idx, cache_kwargs)
+            key_states, value_states = past_key_values.update(key_states, value_states, layer_idx, cache_kwargs)
 
         # Repeat key/value heads if using GQA
         # Use repeat_kv function from transformers if available, otherwise use _repeat_kv method
@@ -336,7 +335,7 @@ class LlamaAttentionWithQKNorm(LlamaAttention):
         if not output_attentions:
             attn_weights = None
 
-        return attn_output, attn_weights, past_key_value
+        return attn_output, attn_weights
 
 
 def _replace_attention_with_qk_norm(model: LlamaModel) -> None:
