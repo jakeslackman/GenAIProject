@@ -2,7 +2,7 @@ from typing import Union
 
 import torch
 import torch.nn as nn
-from transformers import GPT2Config, GPT2Model, LlamaConfig, LlamaModel, PreTrainedModel
+from transformers import GPT2Config, GPT2Model, LlamaConfig, LlamaModel, PreTrainedModel, LlamaAttention
 
 # LoRA / PEFT
 try:
@@ -98,7 +98,7 @@ def get_loss_fn(loss: Union[str, nn.Module]) -> nn.Module:
         raise ValueError(f"Unsupported loss function: {loss}")
 
 
-def get_transformer_backbone(key, kwargs) -> PreTrainedModel:
+def get_transformer_backbone(key, kwargs) -> tuple[PreTrainedModel, int]:
     kwargs = dict(kwargs or {})
 
     if key == "GPT2":
@@ -114,6 +114,7 @@ def get_transformer_backbone(key, kwargs) -> PreTrainedModel:
         model_dim = config.n_embd
     elif key == "llama":
         bidirectional_attention = bool(kwargs.pop("bidirectional_attention", False))
+        use_qk_norm = bool(kwargs.pop("use_qk_norm", False))
 
         config = LlamaConfig(**kwargs)
         if bidirectional_attention:
@@ -124,6 +125,10 @@ def get_transformer_backbone(key, kwargs) -> PreTrainedModel:
 
         model.embed_tokens.weight.requires_grad = False
         model.embed_tokens.weight.zero_()
+        
+        # Apply QK normalization if requested
+        if use_qk_norm:
+            _replace_attention_with_qk_norm(model)
     else:
         raise ValueError(f"Unknown backbone key {key}")
 
@@ -216,6 +221,130 @@ class NoRoPE(nn.Module):
         cos = hidden_states.new_ones(batch_size, seq_len, self.head_dim)
         sin = hidden_states.new_zeros(batch_size, seq_len, self.head_dim)
         return cos, sin
+
+
+class LlamaAttentionWithQKNorm(LlamaAttention):
+    """
+    LlamaAttention with QK normalization.
+    Normalizes query and key vectors before computing attention scores.
+    This helps stabilize training and improve model performance.
+    """
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        attention_mask: torch.Tensor | None = None,
+        position_ids: torch.LongTensor | None = None,
+        past_key_value: torch.Tensor | None = None,
+        output_attentions: bool = False,
+        use_cache: bool = False,
+        cache_position: torch.LongTensor | None = None,
+        position_embeddings: tuple[torch.Tensor, torch.Tensor] | None = None,
+        **kwargs,
+    ) -> tuple[torch.Tensor, torch.Tensor | None, tuple[torch.Tensor, ...] | None]:
+        """
+        Forward pass with QK normalization.
+        Normalizes Q and K vectors (L2 normalization) before computing attention scores.
+        """
+        bsz, q_len, _ = hidden_states.size()
+
+        # Get Q, K, V projections (same as parent class)
+        query_states = self.q_proj(hidden_states)
+        key_states = self.k_proj(hidden_states)
+        value_states = self.v_proj(hidden_states)
+
+        query_states = query_states.view(bsz, q_len, self.num_heads, self.head_dim).transpose(1, 2)
+        key_states = key_states.view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
+        value_states = value_states.view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
+
+        # Apply rotary position embeddings if provided
+        cos, sin = None, None
+        if position_embeddings is not None:
+            cos, sin = position_embeddings
+            from transformers.models.llama.modeling_llama import apply_rotary_pos_emb
+
+            query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
+
+        # Apply QK normalization: normalize Q and K vectors (L2 norm)
+        # Shape: [bsz, num_heads, q_len, head_dim]
+        query_norm = torch.norm(query_states, p=2, dim=-1, keepdim=True)
+        key_norm = torch.norm(key_states, p=2, dim=-1, keepdim=True)
+        
+        # Avoid division by zero
+        eps = 1e-8
+        query_states = query_states / (query_norm + eps)
+        key_states = key_states / (key_norm + eps)
+
+        # Handle past_key_value for caching (same as parent)
+        if past_key_value is not None:
+            cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}
+            key_states, value_states = past_key_value.update(key_states, value_states, self.layer_idx, cache_kwargs)
+
+        # Repeat key/value heads if using GQA
+        # Use repeat_kv function from transformers if available, otherwise use _repeat_kv method
+        from transformers.models.llama.modeling_llama import repeat_kv
+        
+        key_states = repeat_kv(key_states, self.num_key_value_groups)
+        value_states = repeat_kv(value_states, self.num_key_value_groups)
+
+        # Compute attention scores: (Q_normalized @ K_normalized^T) / sqrt(head_dim)
+        attn_weights = torch.matmul(query_states, key_states.transpose(2, 3)) / (self.head_dim**0.5)
+
+        # Apply attention mask if provided
+        if attention_mask is not None:
+            if attention_mask.size() != (bsz, 1, q_len, key_states.size(2)):
+                raise ValueError(
+                    f"Attention mask should be of size {(bsz, 1, q_len, key_states.size(2))}, "
+                    f"but is {attention_mask.size()}"
+                )
+            attn_weights = attn_weights + attention_mask
+
+        # Convert to float32 for numerical stability
+        attn_weights = nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query_states.dtype)
+        attn_weights = nn.functional.dropout(attn_weights, p=self.attention_dropout, training=self.training)
+
+        attn_output = torch.matmul(attn_weights, value_states)
+
+        if attn_output.size() != (bsz, self.num_heads, q_len, self.head_dim):
+            raise ValueError(
+                f"`attn_output` should be of size {(bsz, self.num_heads, q_len, self.head_dim)}, "
+                f"but is {attn_output.size()}"
+            )
+
+        attn_output = attn_output.transpose(1, 2).contiguous()
+        attn_output = attn_output.reshape(bsz, q_len, -1)
+        attn_output = self.o_proj(attn_output)
+
+        if not output_attentions:
+            attn_weights = None
+
+        return attn_output, attn_weights, past_key_value
+
+
+def _replace_attention_with_qk_norm(model: LlamaModel) -> None:
+    """
+    Replace all LlamaAttention layers in a LlamaModel (or LlamaBidirectionalModel) 
+    with LlamaAttentionWithQKNorm.
+    This modifies the model in-place.
+    
+    Args:
+        model: The LlamaModel or LlamaBidirectionalModel instance to modify
+    """
+    from transformers.models.llama.modeling_llama import LlamaDecoderLayer
+    
+    for layer_idx, layer in enumerate(model.layers):
+        if isinstance(layer, LlamaDecoderLayer) and hasattr(layer, "self_attn"):
+            # Create new attention layer with QK norm, copying config from existing
+            old_attn = layer.self_attn
+            # Get layer_idx from old attention if available, otherwise use loop index
+            attn_layer_idx = getattr(old_attn, "layer_idx", layer_idx)
+            new_attn = LlamaAttentionWithQKNorm(
+                config=model.config,
+                layer_idx=attn_layer_idx,
+            )
+            # Copy weights from old attention to new
+            new_attn.load_state_dict(old_attn.state_dict(), strict=False)
+            layer.self_attn = new_attn
 
 
 class LlamaBidirectionalModel(LlamaModel):

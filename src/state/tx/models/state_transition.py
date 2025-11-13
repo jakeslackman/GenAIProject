@@ -133,6 +133,9 @@ class StateTransitionPerturbationModel(PerturbationModel):
             gpt: e.g. "TranslationTransformerSamplesModel".
             model_kwargs: dictionary passed to that model's constructor.
             loss: choice of distributional metric ("sinkhorn", "energy", etc.).
+            transformer_backbone_kwargs: dictionary of kwargs passed to transformer backbone.
+                For Llama backbone, can include `use_qk_norm=True` to enable QK normalization
+                in attention layers (normalizes query and key vectors before computing attention scores).
             **kwargs: anything else to pass up to PerturbationModel or not used.
         """
         # Call the parent PerturbationModel constructor
