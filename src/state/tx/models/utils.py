@@ -237,6 +237,8 @@ class LlamaAttentionWithQKNorm(LlamaAttention):
         This is identical to LlamaAttention initialization.
         """
         super().__init__(config, layer_idx=layer_idx, **kwargs)
+        # Ensure we have access to config for computing dimensions if needed
+        self.config = config
 
     def forward(
         self,
@@ -261,9 +263,14 @@ class LlamaAttentionWithQKNorm(LlamaAttention):
         key_states = self.k_proj(hidden_states)
         value_states = self.v_proj(hidden_states)
 
-        query_states = query_states.view(bsz, q_len, self.num_heads, self.head_dim).transpose(1, 2)
-        key_states = key_states.view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
-        value_states = value_states.view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
+        # Get dimensions - try attribute first, fall back to config if needed
+        num_heads = getattr(self, 'num_heads', self.config.num_attention_heads)
+        num_key_value_heads = getattr(self, 'num_key_value_heads', getattr(self.config, 'num_key_value_heads', num_heads))
+        head_dim = getattr(self, 'head_dim', self.config.hidden_size // num_heads)
+
+        query_states = query_states.view(bsz, q_len, num_heads, head_dim).transpose(1, 2)
+        key_states = key_states.view(bsz, q_len, num_key_value_heads, head_dim).transpose(1, 2)
+        value_states = value_states.view(bsz, q_len, num_key_value_heads, head_dim).transpose(1, 2)
 
         # Apply rotary position embeddings if provided
         cos, sin = None, None
@@ -286,17 +293,19 @@ class LlamaAttentionWithQKNorm(LlamaAttention):
         # Handle past_key_value for caching (same as parent)
         if past_key_value is not None:
             cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}
-            key_states, value_states = past_key_value.update(key_states, value_states, self.layer_idx, cache_kwargs)
+            layer_idx = getattr(self, 'layer_idx', None)
+            key_states, value_states = past_key_value.update(key_states, value_states, layer_idx, cache_kwargs)
 
         # Repeat key/value heads if using GQA
         # Use repeat_kv function from transformers if available, otherwise use _repeat_kv method
         from transformers.models.llama.modeling_llama import repeat_kv
         
-        key_states = repeat_kv(key_states, self.num_key_value_groups)
-        value_states = repeat_kv(value_states, self.num_key_value_groups)
+        num_key_value_groups = getattr(self, 'num_key_value_groups', num_heads // num_key_value_heads)
+        key_states = repeat_kv(key_states, num_key_value_groups)
+        value_states = repeat_kv(value_states, num_key_value_groups)
 
         # Compute attention scores: (Q_normalized @ K_normalized^T) / sqrt(head_dim)
-        attn_weights = torch.matmul(query_states, key_states.transpose(2, 3)) / (self.head_dim**0.5)
+        attn_weights = torch.matmul(query_states, key_states.transpose(2, 3)) / (head_dim**0.5)
 
         # Apply attention mask if provided
         if attention_mask is not None:
@@ -309,13 +318,14 @@ class LlamaAttentionWithQKNorm(LlamaAttention):
 
         # Convert to float32 for numerical stability
         attn_weights = nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query_states.dtype)
-        attn_weights = nn.functional.dropout(attn_weights, p=self.attention_dropout, training=self.training)
+        attention_dropout = getattr(self, 'attention_dropout', 0.0)
+        attn_weights = nn.functional.dropout(attn_weights, p=attention_dropout, training=self.training)
 
         attn_output = torch.matmul(attn_weights, value_states)
 
-        if attn_output.size() != (bsz, self.num_heads, q_len, self.head_dim):
+        if attn_output.size() != (bsz, num_heads, q_len, head_dim):
             raise ValueError(
-                f"`attn_output` should be of size {(bsz, self.num_heads, q_len, self.head_dim)}, "
+                f"`attn_output` should be of size {(bsz, num_heads, q_len, head_dim)}, "
                 f"but is {attn_output.size()}"
             )
 
