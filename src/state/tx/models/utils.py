@@ -231,6 +231,13 @@ class LlamaAttentionWithQKNorm(LlamaAttention):
     This helps stabilize training and improve model performance.
     """
 
+    def __init__(self, config, layer_idx: int | None = None, **kwargs):
+        """
+        Initialize LlamaAttentionWithQKNorm.
+        This is identical to LlamaAttention initialization.
+        """
+        super().__init__(config, layer_idx=layer_idx, **kwargs)
+
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -335,16 +342,22 @@ def _replace_attention_with_qk_norm(model: LlamaModel) -> None:
     
     for layer_idx, layer in enumerate(model.layers):
         if isinstance(layer, LlamaDecoderLayer) and hasattr(layer, "self_attn"):
-            # Create new attention layer with QK norm, copying config from existing
+            # Get the old attention layer
             old_attn = layer.self_attn
             # Get layer_idx from old attention if available, otherwise use loop index
             attn_layer_idx = getattr(old_attn, "layer_idx", layer_idx)
+            
+            # Create new attention layer with QK norm - this will initialize all parent attributes
             new_attn = LlamaAttentionWithQKNorm(
                 config=model.config,
                 layer_idx=attn_layer_idx,
             )
-            # Copy weights from old attention to new
-            new_attn.load_state_dict(old_attn.state_dict(), strict=False)
+            
+            # Copy all weights and buffers from old attention to new
+            # This ensures all parameters (q_proj, k_proj, v_proj, o_proj) are copied
+            new_attn.load_state_dict(old_attn.state_dict(), strict=True)
+            
+            # Replace the attention layer
             layer.self_attn = new_attn
 
 
