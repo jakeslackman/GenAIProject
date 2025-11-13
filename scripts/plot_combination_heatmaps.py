@@ -475,8 +475,8 @@ def plot_heatmap(
     vmin: Optional[float] = None,
     vmax: Optional[float] = None,
     summary_depth: Optional[int] = None,
-) -> Optional[List[Dict[str, object]]]:
-    """Render and save a single heatmap."""
+) -> Tuple[Optional[List[Dict[str, object]]], List[str], List[str]]:
+    """Render and save a single heatmap. Returns (summaries, reordered_pert_names, reordered_cell_names)."""
     df = pd.DataFrame(data, index=pert_names, columns=cell_names)
     height = max(6.0, min(0.02 * len(pert_names), 30.0))
     width = max(8.0, min(0.35 * len(cell_names), 40.0))
@@ -503,7 +503,16 @@ def plot_heatmap(
     cluster_grid.fig.tight_layout()
     output_path.parent.mkdir(parents=True, exist_ok=True)
     cluster_grid.savefig(output_path, dpi=dpi)
+    # Also save as PDF
+    pdf_path = output_path.with_suffix('.pdf')
+    cluster_grid.savefig(pdf_path, format='pdf')
     plt.close(cluster_grid.fig)
+
+    # Extract reordered indices from the clustermap
+    row_order = cluster_grid.dendrogram_row.reordered_ind
+    col_order = cluster_grid.dendrogram_col.reordered_ind
+    reordered_pert_names = [pert_names[i] for i in row_order]
+    reordered_cell_names = [cell_names[i] for i in col_order]
 
     if summary_depth is not None and summary_depth > 0:
         summaries: List[Dict[str, object]] = []
@@ -521,8 +530,8 @@ def plot_heatmap(
                     col_linkage, list(cell_names), df.values, axis="cell", max_depth=summary_depth
                 )
             )
-        return summaries
-    return None
+        return summaries, reordered_pert_names, reordered_cell_names
+    return None, reordered_pert_names, reordered_cell_names
 
 
 def main() -> None:
@@ -577,7 +586,7 @@ def main() -> None:
     for max_drug, matrices in sorted(reduced_payload.items()):
         if raw_max:
             raw_path = output_dir / f"heatmap_max_drugs_{max_drug}_raw.png"
-            plot_heatmap(
+            _, _, _ = plot_heatmap(
                 matrices["raw"],
                 pert_names,
                 cell_names,
@@ -589,7 +598,7 @@ def main() -> None:
                 vmax=raw_max,
             )
         effect_path = output_dir / f"heatmap_max_drugs_{max_drug}_effect.png"
-        effect_summaries = plot_heatmap(
+        effect_summaries, _, _ = plot_heatmap(
             matrices["effect"],
             pert_names,
             cell_names,
@@ -606,7 +615,7 @@ def main() -> None:
             write_cluster_summary(effect_summaries, summary_path)
         if args.column_normalize and "effect_colnorm" in matrices:
             effect_norm_path = output_dir / f"heatmap_max_drugs_{max_drug}_effect_colnorm.png"
-            plot_heatmap(
+            _, clustered_pert_names, clustered_cell_names = plot_heatmap(
                 matrices["effect_colnorm"],
                 pert_names,
                 cell_names,
@@ -620,6 +629,28 @@ def main() -> None:
                 vmin=0.0,
                 vmax=1.0,
             )
+            # Save the matrix for max_drugs=32
+            if max_drug == 32:
+                # Reorder the matrix to match the clustered order
+                pert_indices = [list(pert_names).index(name) for name in clustered_pert_names]
+                cell_indices = [list(cell_names).index(name) for name in clustered_cell_names]
+                clustered_matrix = matrices["effect_colnorm"][np.ix_(pert_indices, cell_indices)]
+                
+                matrix_path = output_dir / f"heatmap_max_drugs_{max_drug}_effect_colnorm_matrix.npy"
+                np.save(matrix_path, clustered_matrix)
+                # Save clustered perturbation order as text file (one per line)
+                pert_order_path = output_dir / f"heatmap_max_drugs_{max_drug}_effect_colnorm_pert_order.txt"
+                with open(pert_order_path, 'w') as f:
+                    for pert in clustered_pert_names:
+                        f.write(f"{pert}\n")
+                # Save clustered cell order as text file (one per line)
+                cell_order_path = output_dir / f"heatmap_max_drugs_{max_drug}_effect_colnorm_cell_order.txt"
+                with open(cell_order_path, 'w') as f:
+                    for cell in clustered_cell_names:
+                        f.write(f"{cell}\n")
+                print(f"Saved clustered matrix ({clustered_matrix.shape}) to {matrix_path}")
+                print(f"Saved clustered perturbation order to {pert_order_path}")
+                print(f"Saved clustered cell order to {cell_order_path}")
 
     # Combined overview for perturbation effects across all bins
     combined_fig = output_dir / "perturbation_effect_overview.png"
@@ -632,7 +663,7 @@ def main() -> None:
         )
     if stacked_effects:
         merged = np.concatenate(stacked_effects, axis=1)
-        overview_summaries = plot_heatmap(
+        overview_summaries, _, _ = plot_heatmap(
             merged,
             pert_names,
             stacked_columns,
@@ -660,7 +691,7 @@ def main() -> None:
         if stacked_norm:
             merged_norm = np.concatenate(stacked_norm, axis=1)
             combined_norm_fig = output_dir / "perturbation_effect_overview_colnorm.png"
-            plot_heatmap(
+            _, _, _ = plot_heatmap(
                 merged_norm,
                 pert_names,
                 stacked_norm_cols,
