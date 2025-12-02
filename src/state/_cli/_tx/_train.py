@@ -120,6 +120,26 @@ def run_tx_train(cfg: DictConfig):
         data_module.save_state(f)
 
     data_module.setup(stage="fit")
+    
+    # Integrate gene embeddings if enabled
+    if cfg["model"]["kwargs"].get("use_gene_adapter", False):
+        gene_embeddings_file = cfg["model"]["kwargs"].get("gene_embeddings_file", None)
+        gene_emb_dim = cfg["model"]["kwargs"].get("gene_emb_dim", 1536)
+        
+        if gene_embeddings_file:
+            logger.info(f"Loading gene embeddings from {gene_embeddings_file}")
+            from ...tx.data.gene_embeddings import GeneEmbeddingLoader
+            from ...tx.data.gene_embedding_wrapper import wrap_datamodule_with_gene_embeddings
+            
+            # Create gene embedding loader
+            gene_loader = GeneEmbeddingLoader(gene_embeddings_file, gene_emb_dim)
+            
+            # Wrap data module to add gene embeddings to batches
+            data_module = wrap_datamodule_with_gene_embeddings(data_module, gene_loader)
+            logger.info("Gene embeddings successfully integrated into data module")
+        else:
+            logger.warning("use_gene_adapter=True but no gene_embeddings_file provided")
+    
     dl = data_module.train_dataloader()
     print("num_workers:", dl.num_workers)
     print("batch size:", dl.batch_size)
