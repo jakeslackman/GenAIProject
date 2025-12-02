@@ -98,6 +98,153 @@ class ConfidenceToken(nn.Module):
 
         return main_output, confidence_pred
 
+# UNMASK FOR USE
+# STGeneAdapter using cross-attention
+class STGeneAdapter(nn.Module):
+    """
+    Cross-attention adapter that uses gene embeddings as queries to attend to cell embeddings.
+    Gene embeddings (GO+GPT) act as queries, while perturbation encodings act as keys/values.
+    """
+    
+    def __init__(
+        self,
+        pert_dim: int,
+        gene_emb_dim: int,
+        output_dim: int,
+        num_heads: int = 8,
+        dropout: float = 0.1,
+    ):
+        """
+        Args:
+            pert_dim: Dimension of perturbation embeddings (after encoding)
+            gene_emb_dim: Dimension of GO+GPT gene embeddings
+            output_dim: Target output dimension (hidden_dim for transformer)
+            num_heads: Number of attention heads
+            dropout: Dropout rate
+        """
+        super().__init__()
+        
+        self.pert_dim = pert_dim
+        self.gene_emb_dim = gene_emb_dim
+        self.output_dim = output_dim
+        self.num_heads = num_heads
+        
+        # Project gene embeddings to output dimension (for queries)
+        self.query_proj = nn.Linear(gene_emb_dim, output_dim)
+        
+        # Project perturbation encodings to output dimension (for keys and values)
+        self.key_proj = nn.Linear(pert_dim, output_dim)
+        self.value_proj = nn.Linear(pert_dim, output_dim)
+        
+        # Multi-head attention
+        self.attention = nn.MultiheadAttention(
+            embed_dim=output_dim,
+            num_heads=num_heads,
+            dropout=dropout,
+            batch_first=True,
+        )
+        
+        # Feed-forward network after attention
+        self.ffn = nn.Sequential(
+            nn.LayerNorm(output_dim),
+            nn.Linear(output_dim, output_dim * 4),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(output_dim * 4, output_dim),
+            nn.Dropout(dropout),
+        )
+        
+        # Final layer norm
+        self.layer_norm = nn.LayerNorm(output_dim)
+    
+    def forward(self, pert_encoding: torch.Tensor, gene_emb: torch.Tensor) -> torch.Tensor:
+        """
+        Cross-attention: gene embeddings attend to perturbation encodings.
+        
+        Args:
+            pert_encoding:-encoded perturbation features [B, S, pert_dim]
+            gene_emb: GO+GPT gene embeddings [B, S, gene_emb_dim]
+        
+        Returns:
+            Attended representation [B, S, output_dim]
+        """
+        # Project inputs to output dimension
+        query = self.query_proj(gene_emb)  # [B, S, output_dim]
+        key = self.key_proj(pert_encoding)  # [B, S, output_dim]
+        value = self.value_proj(pert_encoding)  # [B, S, output_dim]
+        
+        # Apply multi-head cross-attention
+        # gene embeddings (query) attend to perturbation encodings (key/value)
+        attn_output, _ = self.attention(query, key, value)  # [B, S, output_dim]
+        
+        # Residual connection with query
+        output = query + attn_output
+        
+        # Feed-forward network with residual
+        output = output + self.ffn(output)
+        
+        # Final layer normalization
+        output = self.layer_norm(output)  # [B, S, output_dim]
+        
+        return output
+
+# # UNMASK FOR USE
+# # STGeneAdapter using concatenation with simple MLP
+# class STGeneAdapter(nn.Module):
+#     """
+#     Adapter that combines perturbation encodings with GO gene embeddings.
+#     Takes both representations and fuses them through a simple affine transformation.
+#     """
+    
+#     def __init__(
+#         self,
+#         pert_dim: int,
+#         gene_emb_dim: int,
+#         output_dim: int,
+#         dropout: float = 0.1,
+#     ):
+#         """
+#         Args:
+#             pert_dim: Dimension of perturbation embeddings (after encoding)
+#             gene_emb_dim: Dimension of GO+GPT gene embeddings
+#             output_dim: Target output dimension (hidden_dim for transformer)
+#             dropout: Dropout rate
+#         """
+#         super().__init__()
+        
+#         self.pert_dim = pert_dim
+#         self.gene_emb_dim = gene_emb_dim
+#         self.output_dim = output_dim
+        
+#         # Simple fusion network
+#         combined_dim = pert_dim + gene_emb_dim
+#         self.adapter = nn.Sequential(
+#             nn.Linear(combined_dim, output_dim),
+#             nn.LayerNorm(output_dim),
+#             nn.GELU(),
+#             nn.Dropout(dropout),
+#             nn.Linear(output_dim, output_dim),
+#         )
+    
+#     def forward(self, pert_encoding: torch.Tensor, gene_emb: torch.Tensor) -> torch.Tensor:
+#         """
+#         Combine perturbation encoding with gene embeddings.
+        
+#         Args:
+#             pert_encoding: Encoded perturbation features [B, S, pert_dim]
+#             gene_emb: GO+GPT gene embeddings [B, S, gene_emb_dim]
+        
+#         Returns:
+#             Combined representation [B, S, output_dim]
+#         """
+#         # Concatenate along feature dimension
+#         combined = torch.cat([pert_encoding, gene_emb], dim=-1)  # [B, S, pert_dim + gene_emb_dim]
+        
+#         # Apply adapter network
+#         output = self.adapter(combined)  # [B, S, output_dim]
+        
+#         return output
+
 
 class StateTransitionPerturbationModel(PerturbationModel):
     """
@@ -183,6 +330,11 @@ class StateTransitionPerturbationModel(PerturbationModel):
 
         self.use_basal_projection = kwargs.get("use_basal_projection", True)
 
+        # Save gene adapter config before building networks
+        self.gene_emb_dim = kwargs.get("gene_emb_dim", 1536) # default for scGenePT embedding dim
+        self.use_gene_adapter = kwargs.get("use_gene_adapter", False)
+        self.gene_embeddings_file = kwargs.get("gene_embeddings_file", None)
+        
         # Build the underlying neural OT network
         self._build_networks(lora_cfg=kwargs.get("lora", None))
 
@@ -361,9 +513,67 @@ class StateTransitionPerturbationModel(PerturbationModel):
                 nn.Linear(self.output_dim // 8, self.output_dim),
             )
 
-    def encode_perturbation(self, pert: torch.Tensor) -> torch.Tensor:
-        """If needed, define how we embed the raw perturbation input."""
-        return self.pert_encoder(pert)
+        if self.use_gene_adapter:
+            self.st_gene_adapter = STGeneAdapter(
+                pert_dim=self.hidden_dim,  # PERT encoded dim (after pert_encoder)
+                gene_emb_dim=self.gene_emb_dim,  # scGenePT embeddings dimension
+                output_dim=self.hidden_dim,  # 672
+                dropout=self.dropout,
+            )
+            
+            # Load gene embeddings from pickle file
+            if self.gene_embeddings_file:
+                self.gene_embeddings_dict = self._load_gene_embeddings(self.gene_embeddings_file)
+                logger.info(f"Loaded {len(self.gene_embeddings_dict)} gene embeddings from {self.gene_embeddings_file}")
+            else:
+                logger.warning("use_gene_adapter=True but no gene_embeddings_file provided")
+                self.gene_embeddings_dict = {}
+        else:
+            self.st_gene_adapter = None
+            self.gene_embeddings_dict = {}
+    
+    def _load_gene_embeddings(self, path: str) -> dict:
+        """Load gene embeddings from pickle file."""
+        import pickle
+        with open(path, 'rb') as f:
+            gene_emb_dict = pickle.load(f)
+        logger.info(f"Gene embeddings dictionary contains {len(gene_emb_dict)} entries")
+        return gene_emb_dict
+    
+    def get_gene_embeddings_for_batch(self, gene_names: list, device: torch.device) -> torch.Tensor:
+        """
+        Get gene embeddings for a list of gene names.
+        If a gene is not found, use zero padding.
+        
+        Args:
+            gene_names: List of gene names
+            device: Device to place tensors on
+        
+        Returns:
+            Tensor of shape [len(gene_names), gene_emb_dim]
+        """
+        embeddings = []
+        zero_emb = torch.zeros(self.gene_emb_dim, device=device)
+        
+        for gene_name in gene_names:
+            if gene_name in self.gene_embeddings_dict:
+                emb = torch.tensor(self.gene_embeddings_dict[gene_name], device=device, dtype=torch.float32)
+            else:
+                emb = zero_emb.clone()
+            embeddings.append(emb)
+        
+        return torch.stack(embeddings, dim=0)  # [num_genes, gene_emb_dim]
+
+    def encode_perturbation(self, pert: torch.Tensor, gene_emb: Optional[torch.Tensor] = None) -> torch.Tensor:
+        """Encode perturbation with optional GO gene embeddings."""
+        pert_encoded = self.pert_encoder(pert)  # Original pert encoding
+        
+        # If gene adapter is enabled and gene embeddings are provided, combine them
+        if self.use_gene_adapter and gene_emb is not None:
+            return self.st_gene_adapter(pert_encoded, gene_emb)
+        else:
+            # Otherwise just return pert encoding
+            return pert_encoded
 
     def encode_basal_expression(self, expr: torch.Tensor) -> torch.Tensor:
         """Define how we embed basal state input, if needed."""
@@ -385,13 +595,23 @@ class StateTransitionPerturbationModel(PerturbationModel):
         if padded:
             pert = batch["pert_emb"].reshape(-1, self.cell_sentence_len, self.pert_dim)
             basal = batch["ctrl_cell_emb"].reshape(-1, self.cell_sentence_len, self.input_dim)
+            # Get gene embeddings if adapter is enabled
+            if self.use_gene_adapter and "gene_emb" in batch:
+                gene_emb = batch["gene_emb"].reshape(-1, self.cell_sentence_len, self.gene_emb_dim)
+            else:
+                gene_emb = None
         else:
             # we are inferencing on a single batch, so accept variable length sentences
             pert = batch["pert_emb"].reshape(1, -1, self.pert_dim)
             basal = batch["ctrl_cell_emb"].reshape(1, -1, self.input_dim)
+            # Get gene embeddings if adapter is enabled
+            if self.use_gene_adapter and "gene_emb" in batch:
+                gene_emb = batch["gene_emb"].reshape(1, -1, self.gene_emb_dim)
+            else:
+                gene_emb = None
 
         # Shape: [B, S, input_dim]
-        pert_embedding = self.encode_perturbation(pert)
+        pert_embedding = self.encode_perturbation(pert, gene_emb)
         control_cells = self.encode_basal_expression(basal)
 
         # Add encodings in input_dim space, then project to hidden_dim
