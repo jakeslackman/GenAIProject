@@ -98,6 +98,77 @@ class ConfidenceToken(nn.Module):
 
         return main_output, confidence_pred
 
+#unmask for use
+# class SEGeneAdapter(nn.Module):
+#     """
+#     Feature-wise Linear Modulation (FiLM).
+#     Uses gene embeddings to scale and shift
+#     basal perturbation / STATE embeddings.
+#     """
+#     def __init__(
+#         self,
+#         pert_dim: int,
+#         gene_emb_dim: int,
+#         output_dim: int,
+#         dropout: float = 0.1,
+#     ):
+#         super().__init__()
+
+#         self.pert_proj = nn.Linear(pert_dim, output_dim)
+
+#         self.gamma = nn.Linear(gene_emb_dim, output_dim)
+#         self.beta  = nn.Linear(gene_emb_dim, output_dim)
+
+#         self.norm = nn.LayerNorm(output_dim)
+#         self.dropout = nn.Dropout(dropout)
+
+#     def forward(self, pert_encoding: torch.Tensor, gene_emb: torch.Tensor) -> torch.Tensor:
+#         # project perturbation to output dim
+#         p = self.pert_proj(pert_encoding)       
+
+#         # generate film parameters from gene embeddings
+#         gamma = self.gamma(gene_emb)           
+#         beta  = self.beta(gene_emb)             
+
+#         # film modulation
+#         out = gamma * p + beta
+#         return self.dropout(self.norm(out))
+
+
+# unmask for use
+# class SEGeneAdapter(nn.Module):
+#     """
+#     gated fusion
+#     Learnable soft gate between STATE (basal) and gene/perturbation embeddings.
+#     """
+#     def __init__(self, pert_dim, gene_emb_dim, output_dim, dropout=0.1):
+#         super().__init__()
+#         self.pert_proj = nn.Linear(pert_dim, output_dim)
+#         self.gene_proj = nn.Linear(gene_emb_dim, output_dim)
+
+#         self.gate = nn.Sequential(
+#             nn.Linear(output_dim * 2, output_dim),
+#             nn.GELU(),
+#             nn.Linear(output_dim, output_dim),
+#             nn.Sigmoid(),
+#         )
+
+#         self.norm = nn.LayerNorm(output_dim)
+#         self.dropout = nn.Dropout(dropout)
+
+#     def forward(self, pert_encoding, gene_emb):
+#         p = self.pert_proj(pert_encoding)
+#         g = self.gene_proj(gene_emb)
+
+#         gate = self.gate(torch.cat([p, g], dim=-1))
+#         out = gate * g + (1.0 - gate) * p
+#         return self.dropout(self.norm(out))
+
+
+
+
+
+
 # UNMASK FOR USE
 # STGeneAdapter using cross-attention
 class STGeneAdapter(nn.Module):
